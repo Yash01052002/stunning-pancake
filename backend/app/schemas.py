@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr, ConfigDict
 
 from app.models import (
     CustomerTier,
+    NotificationType,
     SentimentLabel,
     TicketChannel,
     TicketPriority,
@@ -135,6 +136,12 @@ class TicketRead(BaseModel):
     triage_outcome: TriageOutcome | None
     triage_method: TriageMethod | None
     sentiment: SentimentLabel | None
+    first_response_due_at: datetime | None
+    resolution_due_at: datetime | None
+    first_responded_at: datetime | None
+    escalated_at: datetime | None
+    first_response_sla_status: str | None
+    resolution_sla_status: str | None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None
@@ -193,3 +200,54 @@ class TriageAccuracyReport(BaseModel):
     coverage_rate: float  # matched / total_tickets
     accuracy_rate: float  # (matched - overridden) / matched
     auto_triage_success_rate: float  # (matched - overridden) / total_tickets
+
+
+# ---- SLA policies ----
+
+
+class SLAPolicyCreate(BaseModel):
+    priority: TicketPriority
+    tier: CustomerTier | None = None
+    first_response_minutes: int
+    resolution_minutes: int
+    active: bool = True
+
+
+class SLAPolicyUpdate(BaseModel):
+    first_response_minutes: int | None = None
+    resolution_minutes: int | None = None
+    active: bool | None = None
+
+
+class SLAPolicyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    priority: TicketPriority
+    tier: CustomerTier | None
+    first_response_minutes: int
+    resolution_minutes: int
+    active: bool
+    created_at: datetime
+
+
+class SLAEscalationReport(BaseModel):
+    checked_at: datetime
+    escalated_ticket_ids: list[str]
+    escalated_count: int
+
+
+# ---- Notifications ----
+
+
+class NotificationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: str
+    ticket_id: str | None
+    type: NotificationType
+    title: str
+    message: str
+    read_at: datetime | None
+    created_at: datetime

@@ -1,12 +1,15 @@
-# Support Ticket System — Backend (Phase 1 + Phase 2 + Phase 3)
+# Support Ticket System — Backend (Phases 1–4)
 
 FastAPI + PostgreSQL API implementing ticket CRUD, comments, event logging,
 JWT auth with role-based access (admin/agent/customer), a rule-based
 auto-triage engine (Phase 2: keyword rules → category/priority/team,
 tier-based priority boost, load-based agent assignment, fallback queue for
-unmatched tickets), and an LLM-based auto-triage engine (Phase 3: Claude
+unmatched tickets), an LLM-based auto-triage engine (Phase 3: Claude
 classifies category/sentiment/priority/confidence; low-confidence results
-route to human review instead of auto-assigning). Which engine runs is a
+route to human review instead of auto-assigning), and SLA timers with
+escalation and notifications (Phase 4: per-(priority, tier) SLA policies,
+first-response/resolution clocks, breach escalation, and customer/agent
+notifications across in-app + email + Slack). Which triage engine runs is a
 config default, overridable per-ticket for A/B comparison.
 
 ## Stack
@@ -26,9 +29,9 @@ docker compose up --build
 This starts Postgres and the API on `http://localhost:8000`. Migrations run
 automatically on container start. API docs: `http://localhost:8000/docs`.
 
-Seed demo data (admin/agent/customer accounts, teams, triage rules, and two
-tickets showing a matched vs. unmatched auto-triage outcome) once the stack
-is up:
+Seed demo data (admin/agent/customer accounts, teams, triage rules, SLA
+policies, and tickets showing matched / unmatched / escalated-breach
+outcomes) once the stack is up:
 
 ```bash
 docker compose exec api python -m scripts.seed
@@ -60,9 +63,13 @@ Tests run against an in-memory SQLite database (schema created directly from
 the SQLAlchemy models, independent of Alembic) and cover auth, role
 permissions, ticket lifecycle/event logging, comment visibility, the rule
 engine (matching, tier boost, fallback routing, load-based assignment,
-override tracking, accuracy reporting), and the LLM engine (a fake
-classifier is injected via `monkeypatch` — no `ANTHROPIC_API_KEY` or network
-access is needed to run the suite).
+override tracking, accuracy reporting), the LLM engine (a fake classifier is
+injected via `monkeypatch` — no `ANTHROPIC_API_KEY` or network access
+needed), and Phase 4 SLA/escalation/notifications (policy precedence, due-date
+computation, first-response tracking, `sla_status` transitions, idempotent
+escalation with priority bump + reassignment, and notification scoping).
+Email/Slack are never actually sent in tests — they no-op because no SMTP
+host / Slack webhook is configured.
 
 ## Data model
 
@@ -79,13 +86,28 @@ access is needed to run the suite).
   - `sentiment` (`positive`/`neutral`/`negative`/`angry`) — LLM engine only;
     `angry` triggers the same one-level priority boost as premium tier, and
     the two stack
+  - `first_response_due_at` / `resolution_due_at` — SLA deadlines, set from
+    the matching policy when the ticket gets a priority
+  - `first_responded_at` — stamped by the first public staff comment;
+    `resolved_at` doubles as the resolution-clock stop
+  - `escalated_at` — set once when an SLA breach escalation fires; makes
+    escalation idempotent
+  - `first_response_sla_status` / `resolution_sla_status` — **computed on
+    read** (not stored): `on_track`/`at_risk`/`breached`/`met`/`breached_late`,
+    so a breach is always visible without a background job keeping a column
+    fresh
 - `triage_rules` — ordered keyword rules (`keyword`, `category`, `priority`,
   `team_id`, `active`, `evaluation_order`); first active match wins for the
   rule engine, and the table doubles as the category→team map the LLM
   engine uses to route a classified ticket (see below)
+- `sla_policies` — first-response/resolution targets in minutes, keyed by
+  `(priority, tier)`; a tier-specific policy beats a `tier=null` one for the
+  same priority
+- `notifications` — in-app notifications (always created); one row per
+  recipient per event
 - `comments` (public replies vs. internal-only notes)
 - `ticket_events` — append-only audit log; every create/update/comment/
-  auto-triage action is recorded here
+  auto-triage/sla_escalated action is recorded here
 
 ## Auto-triage
 
@@ -151,6 +173,67 @@ the default, or leave it on `rule` and use `POST /tickets/{id}/triage?engine=llm
 per ticket to compare the two engines' output side by side without
 changing the default for other traffic.
 
+## SLA, escalation & notifications (Phase 4)
+
+### SLA clocks
+
+Each ticket has two independent clocks, set from the matching `sla_policies`
+row once the ticket has a priority (during triage, or when staff sets
+priority manually):
+
+- **first response** — stopped by the first *public* staff comment
+  (internal notes don't count); `first_responded_at`
+- **resolution** — stopped by status → `resolved`; `resolved_at`
+
+Policy lookup is `(priority, tier)` with tier as the more specific match: a
+policy scoped to a tier wins over a `tier=null` policy for the same
+priority, so you can set a general P1 target plus a tighter P1 target just
+for premium customers.
+
+Each clock's live state (`first_response_sla_status` /
+`resolution_sla_status`) is **computed on every read**, not stored:
+`on_track` → `at_risk` (within `SLA_AT_RISK_WINDOW_MINUTES`, default 30, of
+the deadline) → `breached`, or `met` / `breached_late` once the clock stops.
+This means a breach is always accurately visible in `GET /tickets/{id}`
+without needing a background job just to keep a status column current.
+
+### Escalation
+
+Seeing a breach and *acting* on it are separate. `POST /sla/escalate`
+(staff) scans open, not-yet-escalated tickets and, for each breach:
+
+1. bumps priority one level (capped at P0)
+2. reassigns to the least-loaded agent on the ticket's team
+3. logs an `sla_escalated` ticket event and notifies the newly-assigned
+   agent (in-app + email) and a Slack channel
+
+It's **idempotent** via `escalated_at` — safe to run repeatedly. There's no
+in-process scheduler: run it from an external cron/scheduler hitting the
+endpoint, or `python -m scripts.run_sla_escalations` as a standalone job
+(host crontab, k8s CronJob, etc.).
+
+**Why an externally-triggered idempotent endpoint and not a background
+asyncio loop:** with multiple API workers, each would run its own loop and
+could double-escalate the same ticket. An idempotent check triggered
+externally behaves identically under any number of workers, and keeps
+scheduling infra out of the app process (revisit alongside the Phase 7
+worker-queue decision).
+
+### Notifications
+
+Three channels, degrading gracefully:
+
+- **in-app** (`notifications` table) — always written; the reliable channel
+  with no external dependency. `GET /notifications` / `PATCH
+  /notifications/{id}/read` are scoped to the current user.
+- **email** — sent only if `SMTP_HOST` is configured; otherwise logged and
+  skipped. Never blocks the ticket action that triggered it.
+- **Slack** — sent only if `SLACK_WEBHOOK_URL` is configured; same no-op
+  behavior otherwise.
+
+Customers are notified on ticket received, in-progress (status → open), and
+resolved. Agents are notified on SLA escalation.
+
 ## API surface
 
 | Method | Path | Notes |
@@ -173,6 +256,12 @@ changing the default for other traffic.
 | GET | `/triage-rules` | staff-only: list rules |
 | PATCH | `/triage-rules/{id}` | admin-only: edit/enable/disable a rule |
 | GET | `/reports/triage-accuracy` | staff-only: coverage/accuracy/override counts (see below) |
+| POST | `/sla-policies` | admin-only: create an SLA policy |
+| GET | `/sla-policies` | staff-only: list policies |
+| PATCH | `/sla-policies/{id}` | admin-only: edit minutes / enable / disable |
+| POST | `/sla/escalate` | staff-only: run the idempotent breach-escalation sweep |
+| GET | `/notifications` | current user's notifications, newest first |
+| PATCH | `/notifications/{id}/read` | mark one of your own notifications read |
 
 ### Triage accuracy report
 
@@ -204,8 +293,16 @@ becomes necessary.
 - **Attachments** are in the master plan's data model but out of scope so
   far (no file storage integration yet); add in a later phase alongside
   proper storage (S3-compatible) and virus/type scanning.
-- **`sla_due_at` and SLA/escalation logic** belong to Phase 4 and are
-  intentionally not in this schema yet.
+- **SLA "business hours" are not modeled** — due dates are computed as a
+  flat wall-clock offset from ticket creation (`created_at + N minutes`),
+  not against a business calendar with working hours/holidays/time zones. A
+  real deployment usually wants business-hour-aware SLA clocks; that's a
+  calendar layer on top of `sla.apply_sla_targets` and deliberately out of
+  scope for this pass.
+- **Escalation runs on demand, not on a built-in schedule** — there's no
+  in-process scheduler (see the SLA section above for why). Wire
+  `POST /sla/escalate` or `scripts/run_sla_escalations.py` to cron / a k8s
+  CronJob in a real deployment.
 - **Regex rules**: the master plan mentions "regex/keyword" rules; only
   keyword (substring) matching is implemented in v1 for the ReDoS reason
   above. If regex is needed later, validate/sandbox patterns (e.g. a

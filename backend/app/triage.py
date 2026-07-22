@@ -17,6 +17,7 @@ v1/v2 design (see docs/support-ticket-system-master-plan.md, Phases 2-3):
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app import sla
 from app.config import settings
 from app.crud import log_event
 from app.llm_classifier import get_classifier
@@ -32,10 +33,10 @@ from app.models import (
     TriageRule,
     User,
     UserRole,
+    bump_priority,
 )
 
 _OPEN_STATUSES = (TicketStatus.NEW, TicketStatus.OPEN, TicketStatus.PENDING)
-_PRIORITY_ORDER = [TicketPriority.P0, TicketPriority.P1, TicketPriority.P2, TicketPriority.P3]
 
 
 def get_fallback_team(db: Session) -> Team | None:
@@ -71,8 +72,7 @@ def boost_priority_for_tier(priority: TicketPriority, tier: CustomerTier | None)
     """Premium customers get bumped one priority level (capped at P0)."""
     if tier != CustomerTier.PREMIUM:
         return priority
-    idx = _PRIORITY_ORDER.index(priority)
-    return _PRIORITY_ORDER[max(idx - 1, 0)]
+    return bump_priority(priority)
 
 
 def boost_priority_for_sentiment(
@@ -81,8 +81,7 @@ def boost_priority_for_sentiment(
     """Angry customers get bumped one priority level (capped at P0)."""
     if sentiment != SentimentLabel.ANGRY:
         return priority
-    idx = _PRIORITY_ORDER.index(priority)
-    return _PRIORITY_ORDER[max(idx - 1, 0)]
+    return bump_priority(priority)
 
 
 def pick_agent_for_team(db: Session, team_id: str) -> User | None:
@@ -148,6 +147,7 @@ def _run_rule_triage(db: Session, ticket: Ticket, actor: User | None) -> Ticket:
     ticket.confidence_score = 1.0
     ticket.triage_outcome = TriageOutcome.MATCHED
     ticket.triage_method = TriageMethod.RULE
+    sla.apply_sla_targets(db, ticket)
 
     log_event(
         db,
@@ -193,6 +193,7 @@ def _run_llm_triage(db: Session, ticket: Ticket, actor: User | None) -> Ticket:
     ticket.priority = priority
     ticket.sentiment = sentiment
     ticket.confidence_score = result.confidence
+    sla.apply_sla_targets(db, ticket)
 
     if result.confidence < settings.llm_confidence_threshold:
         # low confidence: don't auto-assign, don't claim ownership — send to a human
