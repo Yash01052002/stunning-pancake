@@ -1,0 +1,132 @@
+from datetime import datetime
+
+from pydantic import BaseModel, EmailStr, ConfigDict
+
+from app.models import CustomerTier, TicketChannel, TicketPriority, TicketStatus, UserRole
+
+
+# ---- Auth ----
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+# ---- Users ----
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+    role: UserRole = UserRole.CUSTOMER
+    tier: CustomerTier | None = None
+    team_id: str | None = None
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: EmailStr
+    full_name: str
+    role: UserRole
+    tier: CustomerTier | None
+    team_id: str | None
+    active: bool
+    created_at: datetime
+
+
+# ---- Teams ----
+
+
+class TeamCreate(BaseModel):
+    name: str
+
+
+class TeamRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    created_at: datetime
+
+
+# ---- Comments ----
+
+
+class CommentCreate(BaseModel):
+    body: str
+    is_internal: bool = False
+
+
+class CommentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    ticket_id: str
+    author_id: str
+    body: str
+    is_internal: bool
+    created_at: datetime
+
+
+# ---- Ticket events ----
+
+
+class TicketEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    ticket_id: str
+    type: str
+    actor_id: str | None
+    payload: dict
+    created_at: datetime
+
+
+# ---- Tickets ----
+
+
+class TicketCreate(BaseModel):
+    subject: str
+    body: str
+    channel: TicketChannel = TicketChannel.API
+    customer_id: str | None = None  # agents/admins may create on behalf of a customer
+
+
+class TicketUpdate(BaseModel):
+    status: TicketStatus | None = None
+    category: str | None = None
+    priority: TicketPriority | None = None
+    assigned_agent_id: str | None = None
+    assigned_team_id: str | None = None
+
+
+class TicketRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    customer_id: str
+    subject: str
+    body: str
+    channel: TicketChannel
+    category: str | None
+    priority: TicketPriority | None
+    status: TicketStatus
+    assigned_agent_id: str | None
+    assigned_team_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: datetime | None
+
+
+class TicketDetailRead(TicketRead):
+    comments: list[CommentRead] = []
+    events: list[TicketEventRead] = []
