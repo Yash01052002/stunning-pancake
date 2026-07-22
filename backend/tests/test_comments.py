@@ -67,4 +67,4 @@ def test_comment_creates_ticket_event(client, customer_headers):
         f"/tickets/{ticket['id']}/comments", json={"body": "hello"}, headers=customer_headers
     )
     detail = client.get(f"/tickets/{ticket['id']}", headers=customer_headers).json()
-    assert [e["type"] for e in detail["events"]] == ["created", "commented"]
+    assert [e["type"] for e in detail["events"]] == ["created", "auto_triaged", "commented"]

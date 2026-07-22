@@ -1,13 +1,27 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app import crud
+from app import crud, database, triage
 from app.database import get_db
 from app.deps import get_current_user, require_staff
 from app.models import Ticket, TicketPriority, TicketStatus, User, UserRole
 from app.schemas import TicketCreate, TicketDetailRead, TicketRead, TicketUpdate
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+
+
+def _run_triage_in_background(ticket_id: str, actor_id: str | None) -> None:
+    """Runs in a background task with its own DB session — the request's
+    session is already torn down by the time background tasks execute."""
+    db = database.SessionLocal()
+    try:
+        ticket = crud.get_ticket(db, ticket_id)
+        if ticket is None:
+            return
+        actor = db.get(User, actor_id) if actor_id else None
+        triage.run_auto_triage(db, ticket, actor=actor)
+    finally:
+        db.close()
 
 
 def _get_ticket_or_404(db: Session, ticket_id: str) -> Ticket:
@@ -25,6 +39,7 @@ def _ensure_can_view(ticket: Ticket, user: User) -> None:
 @router.post("", response_model=TicketRead, status_code=status.HTTP_201_CREATED)
 def create_ticket(
     payload: TicketCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -39,7 +54,7 @@ def create_ticket(
             )
         customer_id = payload.customer_id
 
-    return crud.create_ticket(
+    ticket = crud.create_ticket(
         db,
         customer_id=customer_id,
         subject=payload.subject,
@@ -47,6 +62,11 @@ def create_ticket(
         channel=payload.channel,
         actor=current_user,
     )
+    # auto-triage runs after the response is sent, in its own DB session —
+    # the ticket returned here reflects pre-triage state (category/priority/
+    # assignment are still null); poll GET /tickets/{id} to see the result.
+    background_tasks.add_task(_run_triage_in_background, ticket.id, current_user.id)
+    return ticket
 
 
 @router.get("", response_model=list[TicketRead])
@@ -95,3 +115,14 @@ def update_ticket(
     ticket = _get_ticket_or_404(db, ticket_id)
     updates = payload.model_dump(exclude_unset=True)
     return crud.update_ticket(db, ticket, updates, actor=current_user)
+
+
+@router.post("/{ticket_id}/triage", response_model=TicketRead)
+def retrigger_triage(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    """Manually re-run the rule engine, e.g. after adding/editing triage rules."""
+    ticket = _get_ticket_or_404(db, ticket_id)
+    return triage.run_auto_triage(db, ticket, actor=current_user)

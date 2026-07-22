@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, Text, Boolean
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, JSON, String, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -48,6 +48,25 @@ class TicketChannel(str, enum.Enum):
     EMAIL = "email"
     API = "api"
     WIDGET = "widget"
+
+
+class TriageOutcome(str, enum.Enum):
+    """Immutable record of whether the rule engine matched this ticket at creation time."""
+
+    MATCHED = "matched"
+    UNMATCHED = "unmatched"
+
+
+class TriageMethod(str, enum.Enum):
+    """Who currently owns this ticket's category/priority/assignment.
+
+    Starts as RULE when a triage rule matches, flips to MANUAL the first
+    time a staff member edits those fields — this is the override signal
+    the Phase 2 accuracy metric is built on.
+    """
+
+    RULE = "rule"
+    MANUAL = "manual"
 
 
 class Team(Base):
@@ -97,6 +116,13 @@ class Ticket(Base):
     )
     assigned_agent_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     assigned_team_id: Mapped[str | None] = mapped_column(ForeignKey("teams.id"), nullable=True)
+    confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    triage_outcome: Mapped[TriageOutcome | None] = mapped_column(
+        Enum(TriageOutcome, native_enum=False), nullable=True
+    )
+    triage_method: Mapped[TriageMethod | None] = mapped_column(
+        Enum(TriageMethod, native_enum=False), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -140,3 +166,28 @@ class TicketEvent(Base):
 
     ticket: Mapped[Ticket] = relationship(back_populates="events")
     actor: Mapped[User | None] = relationship()
+
+
+class TriageRule(Base):
+    """v1 rule: case-insensitive keyword match against subject+body.
+
+    Plain substring matching (not regex) is a deliberate choice — admin-supplied
+    regex patterns risk ReDoS, and keyword matching is sufficient for v1's
+    "refund" / "down" / "security" style rules described in the master plan.
+    """
+
+    __tablename__ = "triage_rules"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    keyword: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    priority: Mapped[TicketPriority] = mapped_column(
+        Enum(TicketPriority, native_enum=False), nullable=False
+    )
+    team_id: Mapped[str | None] = mapped_column(ForeignKey("teams.id"), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    evaluation_order: Mapped[int] = mapped_column(Integer, default=100)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    team: Mapped[Team | None] = relationship()
