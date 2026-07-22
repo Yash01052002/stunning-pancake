@@ -3,8 +3,11 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import notifications, sla
 from app.models import (
     Comment,
+    Notification,
+    SLAPolicy,
     Team,
     Ticket,
     TicketEvent,
@@ -12,6 +15,7 @@ from app.models import (
     TriageMethod,
     TriageRule,
     User,
+    UserRole,
 )
 from app.security import hash_password
 
@@ -86,6 +90,7 @@ def create_ticket(
         actor,
         {"subject": subject, "channel": channel.value if hasattr(channel, "value") else channel},
     )
+    notifications.notify_customer_ticket_received(db, ticket)
     db.commit()
     db.refresh(ticket)
     return ticket
@@ -145,6 +150,14 @@ def update_ticket(db: Session, ticket: Ticket, updates: dict, actor: User) -> Ti
         # Phase 2 auto-triage accuracy metric reads.
         ticket.triage_method = TriageMethod.MANUAL
 
+    if "priority" in changes:
+        # a human (re)set priority manually — recompute SLA due dates the
+        # same way triage does, from whichever policy now matches
+        sla.apply_sla_targets(db, ticket)
+
+    if "status" in changes:
+        notifications.notify_customer_status_change(db, ticket, updates["status"])
+
     if changes:
         log_event(db, ticket, "updated", actor, {"changes": changes})
         db.commit()
@@ -163,12 +176,21 @@ def add_comment(
     )
     db.add(comment)
     db.flush()
+
+    is_first_response = (
+        author.role in (UserRole.AGENT, UserRole.ADMIN)
+        and not is_internal
+        and ticket.first_responded_at is None
+    )
+    if is_first_response:
+        ticket.first_responded_at = _now()
+
     log_event(
         db,
         ticket,
         "commented",
         author,
-        {"comment_id": comment.id, "is_internal": is_internal},
+        {"comment_id": comment.id, "is_internal": is_internal, "first_response": is_first_response},
     )
     db.commit()
     db.refresh(comment)
@@ -201,3 +223,56 @@ def update_triage_rule(db: Session, rule: TriageRule, updates: dict) -> TriageRu
     db.commit()
     db.refresh(rule)
     return rule
+
+
+# ---- SLA policies ----
+
+
+def create_sla_policy(db: Session, **fields) -> SLAPolicy:
+    policy = SLAPolicy(**fields)
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+def list_sla_policies(db: Session) -> list[SLAPolicy]:
+    return list(db.scalars(select(SLAPolicy).order_by(SLAPolicy.priority)))
+
+
+def get_sla_policy(db: Session, policy_id: str) -> SLAPolicy | None:
+    return db.get(SLAPolicy, policy_id)
+
+
+def update_sla_policy(db: Session, policy: SLAPolicy, updates: dict) -> SLAPolicy:
+    for field, value in updates.items():
+        if value is not None:
+            setattr(policy, field, value)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+# ---- Notifications ----
+
+
+def list_notifications(db: Session, user_id: str) -> list[Notification]:
+    return list(
+        db.scalars(
+            select(Notification)
+            .where(Notification.user_id == user_id)
+            .order_by(Notification.created_at.desc())
+        )
+    )
+
+
+def get_notification(db: Session, notification_id: str) -> Notification | None:
+    return db.get(Notification, notification_id)
+
+
+def mark_notification_read(db: Session, notification: Notification) -> Notification:
+    if notification.read_at is None:
+        notification.read_at = _now()
+        db.commit()
+        db.refresh(notification)
+    return notification

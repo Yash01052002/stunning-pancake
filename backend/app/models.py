@@ -1,10 +1,11 @@
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, JSON, String, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.config import settings
 from app.database import Base
 
 
@@ -81,6 +82,16 @@ class SentimentLabel(str, enum.Enum):
     ANGRY = "angry"
 
 
+_PRIORITY_ORDER = [TicketPriority.P0, TicketPriority.P1, TicketPriority.P2, TicketPriority.P3]
+
+
+def bump_priority(priority: TicketPriority) -> TicketPriority:
+    """One level more urgent, capped at P0. Shared by triage (tier/sentiment
+    boosts) and SLA escalation (breach boost) so both use one ordering."""
+    idx = _PRIORITY_ORDER.index(priority)
+    return _PRIORITY_ORDER[max(idx - 1, 0)]
+
+
 class Team(Base):
     __tablename__ = "teams"
 
@@ -138,6 +149,16 @@ class Ticket(Base):
     sentiment: Mapped[SentimentLabel | None] = mapped_column(
         Enum(SentimentLabel, native_enum=False), nullable=True
     )
+    first_response_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolution_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -153,6 +174,42 @@ class Ticket(Base):
     events: Mapped[list["TicketEvent"]] = relationship(
         back_populates="ticket", cascade="all, delete-orphan", order_by="TicketEvent.created_at"
     )
+
+    @property
+    def first_response_sla_status(self) -> str | None:
+        return _sla_status(self.first_response_due_at, self.first_responded_at)
+
+    @property
+    def resolution_sla_status(self) -> str | None:
+        return _sla_status(self.resolution_due_at, self.resolved_at)
+
+
+def as_aware_utc(dt: datetime) -> datetime:
+    """SQLite (unlike Postgres) drops tzinfo on round-trip even for
+    DateTime(timezone=True) columns. Every datetime this app stores is
+    produced by _now() (UTC), so a naive value read back is always UTC —
+    reattach it before comparing, or naive/aware comparison raises."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _sla_status(due_at: datetime | None, satisfied_at: datetime | None) -> str | None:
+    """Computed fresh on every read (never cached), so it's always accurate
+    without needing a background job to keep it up to date:
+    - None: no SLA target set (priority not yet triaged)
+    - met / breached_late: the clock already stopped (responded/resolved)
+    - on_track / at_risk / breached: the clock is still running
+    """
+    if due_at is None:
+        return None
+    due_at = as_aware_utc(due_at)
+    if satisfied_at is not None:
+        return "met" if as_aware_utc(satisfied_at) <= due_at else "breached_late"
+    now = datetime.now(timezone.utc)
+    if now > due_at:
+        return "breached"
+    if now > due_at - timedelta(minutes=settings.sla_at_risk_window_minutes):
+        return "at_risk"
+    return "on_track"
 
 
 class Comment(Base):
@@ -206,3 +263,57 @@ class TriageRule(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     team: Mapped[Team | None] = relationship()
+
+
+class SLAPolicy(Base):
+    """Time-to-first-response / time-to-resolution targets, in minutes.
+
+    Looked up by (priority, tier) with tier as the more specific match:
+    a policy with tier set wins over a tier=null policy for the same
+    priority, so you can have a general P1 policy plus a tighter P1 policy
+    just for premium customers.
+    """
+
+    __tablename__ = "sla_policies"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    priority: Mapped[TicketPriority] = mapped_column(
+        Enum(TicketPriority, native_enum=False), nullable=False
+    )
+    tier: Mapped[CustomerTier | None] = mapped_column(
+        Enum(CustomerTier, native_enum=False), nullable=True
+    )
+    first_response_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    resolution_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class NotificationType(str, enum.Enum):
+    TICKET_RECEIVED = "ticket_received"
+    TICKET_IN_PROGRESS = "ticket_in_progress"
+    TICKET_RESOLVED = "ticket_resolved"
+    SLA_AT_RISK = "sla_at_risk"
+    SLA_ESCALATED = "sla_escalated"
+
+
+class Notification(Base):
+    """In-app notification. Always created regardless of whether email/Slack
+    are configured — this is the one channel that has no external
+    dependency, so it's the reliable fallback for "did anyone get told?"."""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    ticket_id: Mapped[str | None] = mapped_column(ForeignKey("tickets.id"), nullable=True)
+    type: Mapped[NotificationType] = mapped_column(
+        Enum(NotificationType, native_enum=False), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    ticket: Mapped[Ticket | None] = relationship(foreign_keys=[ticket_id])

@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     llm_confidence_threshold: float = 0.6
     triage_categories_csv: str = "billing,incident,security,account,general"
 
+    # Phase 4: SLA timers & escalation
+    sla_at_risk_window_minutes: int = 30
+    # notification channels — both are best-effort and log-only when unset,
+    # so the app runs with zero external config (see app/notifications.py)
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from_address: str = "support@example.com"
+    slack_webhook_url: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
