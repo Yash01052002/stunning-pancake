@@ -1,11 +1,13 @@
-# Support Ticket System — Backend (Phase 1 + Phase 2)
+# Support Ticket System — Backend (Phase 1 + Phase 2 + Phase 3)
 
 FastAPI + PostgreSQL API implementing ticket CRUD, comments, event logging,
-and JWT auth with role-based access (admin/agent/customer), plus a
-rule-based auto-triage engine (Phase 2 v1: keyword rules → category/
-priority/team, tier-based priority boost, load-based agent assignment,
-fallback queue for unmatched tickets). ML/LLM-based triage (Phase 3) is not
-yet implemented.
+JWT auth with role-based access (admin/agent/customer), a rule-based
+auto-triage engine (Phase 2: keyword rules → category/priority/team,
+tier-based priority boost, load-based agent assignment, fallback queue for
+unmatched tickets), and an LLM-based auto-triage engine (Phase 3: Claude
+classifies category/sentiment/priority/confidence; low-confidence results
+route to human review instead of auto-assigning). Which engine runs is a
+config default, overridable per-ticket for A/B comparison.
 
 ## Stack
 
@@ -56,33 +58,46 @@ python -m pytest
 
 Tests run against an in-memory SQLite database (schema created directly from
 the SQLAlchemy models, independent of Alembic) and cover auth, role
-permissions, ticket lifecycle/event logging, comment visibility, and the
-Phase 2 triage engine (rule matching, tier boost, fallback routing,
-load-based assignment, override tracking, accuracy reporting).
+permissions, ticket lifecycle/event logging, comment visibility, the rule
+engine (matching, tier boost, fallback routing, load-based assignment,
+override tracking, accuracy reporting), and the LLM engine (a fake
+classifier is injected via `monkeypatch` — no `ANTHROPIC_API_KEY` or network
+access is needed to run the suite).
 
 ## Data model
 
 - `teams`, `users` (role: admin/agent/customer, `tier` on customers)
 - `tickets` (status: new → open → pending → resolved → closed)
-  - `triage_outcome` (`matched`/`unmatched`) — immutable, set once by the
-    rule engine at creation time
-  - `triage_method` (`rule`/`manual`) — current attribution; flips from
-    `rule` to `manual` the first time staff edits category/priority/
-    assignment, which is the override signal the accuracy report reads
-  - `confidence_score` — `1.0` for a rule match; reserved for a real
-    confidence value once Phase 3 adds ML/LLM classification
+  - `triage_outcome` (`matched`/`low_confidence`/`unmatched`) — immutable,
+    set once by whichever engine ran at creation/retrigger time
+  - `triage_method` (`rule`/`llm`/`manual`/null) — current attribution;
+    flips to `manual` the first time staff edits category/priority/
+    assignment, which is the override signal the accuracy report reads.
+    Stays null for `low_confidence` tickets — nothing has claimed them yet.
+  - `confidence_score` — `1.0` for a rule match; the LLM's self-reported
+    0.0–1.0 confidence for an LLM classification
+  - `sentiment` (`positive`/`neutral`/`negative`/`angry`) — LLM engine only;
+    `angry` triggers the same one-level priority boost as premium tier, and
+    the two stack
 - `triage_rules` — ordered keyword rules (`keyword`, `category`, `priority`,
-  `team_id`, `active`, `evaluation_order`); first active match wins
+  `team_id`, `active`, `evaluation_order`); first active match wins for the
+  rule engine, and the table doubles as the category→team map the LLM
+  engine uses to route a classified ticket (see below)
 - `comments` (public replies vs. internal-only notes)
 - `ticket_events` — append-only audit log; every create/update/comment/
   auto-triage action is recorded here
 
-## Auto-triage (Phase 2 v1)
+## Auto-triage
 
 On ticket creation, a background task (its own DB session — the request's
-session is already closed by the time background tasks run) evaluates
-active `triage_rules` in `evaluation_order`, case-insensitive substring
-match against `subject + body`. On the first match:
+session is already closed by the time background tasks run) runs the
+configured engine (`AUTO_TRIAGE_ENGINE`, default `rule`). Either engine can
+also be invoked explicitly per ticket via `POST /tickets/{id}/triage?engine=`.
+
+### Rule engine (Phase 2)
+
+Evaluates active `triage_rules` in `evaluation_order`, case-insensitive
+substring match against `subject + body`. On the first match:
 
 1. category/priority/team are set from the rule
 2. premium-tier customers get a one-priority-level boost (capped at P0)
@@ -90,19 +105,51 @@ match against `subject + body`. On the first match:
    `new`/`open`/`pending`) is auto-assigned
 4. an `auto_triaged` ticket event records what happened
 
-If no rule matches, the ticket is routed to a fallback team (named via
-`FALLBACK_TRIAGE_TEAM_NAME`, default `"Triage"`) for human triage, or left
-unassigned if that team doesn't exist.
+**Why substring keywords and not regex:** admin-supplied regex risks ReDoS;
+plain keyword matching is sufficient for "refund"/"down"/"security" style
+rules and avoids that class of vulnerability entirely.
+
+### LLM engine (Phase 3)
+
+Sends the ticket's subject + body to Claude (`app/llm_classifier.py`) and
+asks for a structured classification — category, sentiment, priority,
+confidence, one-sentence rationale — using the Anthropic SDK's
+`client.messages.parse(..., output_format=LLMClassification)`, which
+validates the response against a Pydantic model instead of hand-parsing
+free text. Model: `LLM_MODEL` (default `claude-sonnet-5`); thinking is
+disabled and no sampling parameters are set, matching Anthropic's guidance
+for fast, deterministic classification tasks.
+
+1. category maps to a team by matching an active `triage_rules.category`
+   (case-insensitive) — the same table the rule engine uses, so there's one
+   category→team mapping to maintain, not two
+2. priority gets boosted one level (capped at P0) for premium-tier
+   customers **and** for `angry` sentiment — both can stack
+3. if confidence is below `LLM_CONFIDENCE_THRESHOLD` (default `0.6`), the
+   classification is still stored (useful context for whoever picks it up)
+   but the ticket is routed to the fallback team **without** auto-assigning
+   an agent or claiming `triage_method` — a human decides from there
+4. if the classifier itself fails (no `ANTHROPIC_API_KEY`, network error,
+   any exception), `classify()` returns `None` and the ticket is routed to
+   the fallback team exactly like an unmatched rule — this is a normal,
+   expected outcome, not a 500
+
+### Shared fallback behavior
+
+If neither engine produces a confident match, the ticket is routed to a
+fallback team (named via `FALLBACK_TRIAGE_TEAM_NAME`, default `"Triage"`)
+for human triage, or left unassigned if that team doesn't exist.
 
 **Why BackgroundTasks and not a queue (Celery/RQ + Redis):** the master
-plan's "async job pipeline" is satisfied at v1 scale by FastAPI's built-in
-BackgroundTasks — it decouples triage from the request/response without
-adding new infra. Revisit this in Phase 7 (Hardening & Scale) if ticket
-volume needs a real worker queue with retries/backpressure.
+plan's "async job pipeline" is satisfied at this scale by FastAPI's
+built-in BackgroundTasks — it decouples triage from the request/response
+without adding new infra. Revisit this in Phase 7 (Hardening & Scale) if
+ticket volume needs a real worker queue with retries/backpressure.
 
-**Why substring keywords and not regex:** admin-supplied regex risks ReDoS;
-plain keyword matching is sufficient for v1's "refund"/"down"/"security"
-style rules and avoids that class of vulnerability entirely.
+**A/B comparison between engines:** set `AUTO_TRIAGE_ENGINE=llm` to make it
+the default, or leave it on `rule` and use `POST /tickets/{id}/triage?engine=llm`
+per ticket to compare the two engines' output side by side without
+changing the default for other traffic.
 
 ## API surface
 
@@ -119,7 +166,7 @@ style rules and avoids that class of vulnerability entirely.
 | GET | `/tickets` | filterable list; customers see only their own tickets |
 | GET | `/tickets/{id}` | full detail incl. comments + event timeline |
 | PATCH | `/tickets/{id}` | staff-only: status/category/priority/assignment; marks the ticket `triage_method=manual` |
-| POST | `/tickets/{id}/triage` | staff-only: manually re-run the rule engine (e.g. after adding a new rule) |
+| POST | `/tickets/{id}/triage?engine=` | staff-only: manually re-run auto-triage; optional `engine=rule\|llm` overrides the configured default for this call |
 | POST | `/tickets/{id}/comments` | customers restricted to public replies on their own ticket |
 | GET | `/tickets/{id}/comments` | internal notes hidden from customers |
 | POST | `/triage-rules` | admin-only: create a rule |
@@ -132,12 +179,18 @@ style rules and avoids that class of vulnerability entirely.
 `GET /reports/triage-accuracy` returns:
 
 - `total_tickets`, `matched`, `unmatched`, `overridden`
-- `coverage_rate` = matched / total — how many tickets a rule fired on
-- `accuracy_rate` = (matched − overridden) / matched — of the ones a rule
-  fired on, how many staff left alone
+- `coverage_rate` = matched / total — how many tickets either engine
+  confidently classified (excludes `low_confidence` and `unmatched`)
+- `accuracy_rate` = (matched − overridden) / matched — of the confidently
+  classified ones, how many staff left alone
 - `auto_triage_success_rate` = (matched − overridden) / total — the master
-  plan's Phase 2 exit criterion ("**>70%** of tickets auto-categorized and
-  routed without agent correction")
+  plan's exit criterion ("**>70%** of tickets auto-categorized and routed
+  without agent correction")
+
+The report doesn't currently break results out by engine (`rule` vs. `llm`)
+— it treats `matched` the same regardless of which engine produced it. Add
+a `triage_method` group-by if comparing engines' accuracy separately
+becomes necessary.
 
 ## Notes / deviations from the master plan
 
@@ -158,3 +211,17 @@ style rules and avoids that class of vulnerability entirely.
   above. If regex is needed later, validate/sandbox patterns (e.g. a
   complexity check or a timeout-bounded matcher) before accepting
   admin-supplied ones.
+- **Duplicate/similar-ticket detection** (Phase 3 master-plan item: "vector
+  search over past tickets ... to suggest existing solutions") is **not
+  implemented yet**. This pass focused on the classifier itself (category/
+  sentiment/priority/confidence) and confidence-gated routing. Adding
+  similarity search is a reasonable next slice — it doesn't need pgvector
+  or a hosted embeddings API to start (Anthropic doesn't offer one; the
+  usual pairing is Voyage AI); a lightweight local bag-of-words cosine
+  similarity over recent tickets would work for v1 at this scale.
+- **LLM engine requires `ANTHROPIC_API_KEY`** to actually classify anything.
+  Without it (or on any network/API failure), `classify()` returns `None`
+  and the ticket is routed to the fallback team exactly like an unmatched
+  rule — this is by design (see "LLM engine" above), not an error path that
+  needs fixing. The test suite never calls the real API; it injects a fake
+  classifier via `monkeypatch.setattr(triage, "get_classifier", ...)`.

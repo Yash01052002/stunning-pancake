@@ -21,6 +21,10 @@ services:
       DATABASE_URL: postgresql+psycopg2://ticketing:ticketing@db:5432/ticketing
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-me}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      AUTO_TRIAGE_ENGINE: ${AUTO_TRIAGE_ENGINE:-rule}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-5}
+      LLM_CONFIDENCE_THRESHOLD: ${LLM_CONFIDENCE_THRESHOLD:-0.6}
     ports:
       - "8000:8000"
     depends_on:

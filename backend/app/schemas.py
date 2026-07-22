@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr, ConfigDict
 
 from app.models import (
     CustomerTier,
+    SentimentLabel,
     TicketChannel,
     TicketPriority,
     TicketStatus,
@@ -133,6 +134,7 @@ class TicketRead(BaseModel):
     confidence_score: float | None
     triage_outcome: TriageOutcome | None
     triage_method: TriageMethod | None
+    sentiment: SentimentLabel | None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None
