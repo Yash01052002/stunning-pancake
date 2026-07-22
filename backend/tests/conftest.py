@@ -4,14 +4,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import crud
+from app import crud, database
 from app.database import Base, get_db
 from app.main import app
 from app.models import CustomerTier, UserRole
 
 
 @pytest.fixture()
-def db_session():
+def db_session(monkeypatch):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -19,6 +19,11 @@ def db_session():
     )
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # the ticket-creation background task opens its own session via
+    # database.SessionLocal() (the request's session is already closed by
+    # the time background tasks run) — point it at the same in-memory
+    # engine so it can see data committed within a test.
+    monkeypatch.setattr(database, "SessionLocal", TestingSessionLocal)
     session = TestingSessionLocal()
     try:
         yield session

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+    fallback_triage_team_name: str = "Triage"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

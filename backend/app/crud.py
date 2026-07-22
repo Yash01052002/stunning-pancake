@@ -9,6 +9,8 @@ from app.models import (
     Ticket,
     TicketEvent,
     TicketStatus,
+    TriageMethod,
+    TriageRule,
     User,
 )
 from app.security import hash_password
@@ -16,6 +18,9 @@ from app.security import hash_password
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_TRIAGE_RELEVANT_FIELDS = {"category", "priority", "assigned_team_id", "assigned_agent_id"}
 
 
 def log_event(
@@ -134,6 +139,12 @@ def update_ticket(db: Session, ticket: Ticket, updates: dict, actor: User) -> Ti
     if "status" in changes and updates.get("status") == TicketStatus.RESOLVED:
         ticket.resolved_at = _now()
 
+    if _TRIAGE_RELEVANT_FIELDS & changes.keys():
+        # a human just touched category/priority/assignment — this ticket is
+        # no longer purely rule-owned, which is the override signal the
+        # Phase 2 auto-triage accuracy metric reads.
+        ticket.triage_method = TriageMethod.MANUAL
+
     if changes:
         log_event(db, ticket, "updated", actor, {"changes": changes})
         db.commit()
@@ -162,3 +173,31 @@ def add_comment(
     db.commit()
     db.refresh(comment)
     return comment
+
+
+# ---- Triage rules ----
+
+
+def create_triage_rule(db: Session, **fields) -> TriageRule:
+    rule = TriageRule(**fields)
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def list_triage_rules(db: Session) -> list[TriageRule]:
+    return list(db.scalars(select(TriageRule).order_by(TriageRule.evaluation_order)))
+
+
+def get_triage_rule(db: Session, rule_id: str) -> TriageRule | None:
+    return db.get(TriageRule, rule_id)
+
+
+def update_triage_rule(db: Session, rule: TriageRule, updates: dict) -> TriageRule:
+    for field, value in updates.items():
+        if value is not None:
+            setattr(rule, field, value)
+    db.commit()
+    db.refresh(rule)
+    return rule

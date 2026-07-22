@@ -15,8 +15,8 @@ def test_customer_can_create_and_view_own_ticket(client, customer_headers):
     assert resp.status_code == 200
     detail = resp.json()
     assert detail["subject"] == "Cannot log in"
-    assert len(detail["events"]) == 1
-    assert detail["events"][0]["type"] == "created"
+    # "created" plus the Phase 2 auto-triage pass (no rule matches here, so it's a no-op)
+    assert [e["type"] for e in detail["events"]] == ["created", "auto_triaged"]
 
 
 def test_customer_cannot_view_others_ticket(client, customer_headers, other_customer_headers):
@@ -88,8 +88,8 @@ def test_agent_can_triage_ticket_and_events_are_logged(client, customer_headers,
 
     detail = client.get(f"/tickets/{ticket['id']}", headers=agent_headers).json()
     event_types = [e["type"] for e in detail["events"]]
-    assert event_types == ["created", "updated"]
-    assert detail["events"][1]["payload"]["changes"]["status"] == {"old": "new", "new": "open"}
+    assert event_types == ["created", "auto_triaged", "updated"]
+    assert detail["events"][2]["payload"]["changes"]["status"] == {"old": "new", "new": "open"}
 
 
 def test_resolving_ticket_sets_resolved_at(client, customer_headers, agent_headers):
