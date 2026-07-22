@@ -51,22 +51,34 @@ class TicketChannel(str, enum.Enum):
 
 
 class TriageOutcome(str, enum.Enum):
-    """Immutable record of whether the rule engine matched this ticket at creation time."""
+    """Immutable record of what the triage engine produced at creation time."""
 
     MATCHED = "matched"
+    LOW_CONFIDENCE = "low_confidence"  # LLM classified it, but below the confidence threshold
     UNMATCHED = "unmatched"
 
 
 class TriageMethod(str, enum.Enum):
     """Who currently owns this ticket's category/priority/assignment.
 
-    Starts as RULE when a triage rule matches, flips to MANUAL the first
-    time a staff member edits those fields — this is the override signal
-    the Phase 2 accuracy metric is built on.
+    Starts as RULE or LLM when the corresponding engine successfully
+    classifies the ticket, flips to MANUAL the first time a staff member
+    edits those fields — this is the override signal the accuracy metric
+    is built on.
     """
 
     RULE = "rule"
+    LLM = "llm"
     MANUAL = "manual"
+
+
+class SentimentLabel(str, enum.Enum):
+    """LLM-detected customer sentiment (Phase 3). Only ANGRY affects priority scoring."""
+
+    POSITIVE = "positive"
+    NEUTRAL = "neutral"
+    NEGATIVE = "negative"
+    ANGRY = "angry"
 
 
 class Team(Base):
@@ -122,6 +134,9 @@ class Ticket(Base):
     )
     triage_method: Mapped[TriageMethod | None] = mapped_column(
         Enum(TriageMethod, native_enum=False), nullable=True
+    )
+    sentiment: Mapped[SentimentLabel | None] = mapped_column(
+        Enum(SentimentLabel, native_enum=False), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(

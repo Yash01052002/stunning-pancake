@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -120,9 +122,15 @@ def update_ticket(
 @router.post("/{ticket_id}/triage", response_model=TicketRead)
 def retrigger_triage(
     ticket_id: str,
+    engine: Literal["rule", "llm"] | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_staff),
 ):
-    """Manually re-run the rule engine, e.g. after adding/editing triage rules."""
+    """Manually re-run auto-triage, e.g. after adding/editing triage rules.
+
+    `engine` overrides the configured default for this call only — pass it
+    explicitly to A/B-compare the rule engine against the LLM engine on a
+    given ticket.
+    """
     ticket = _get_ticket_or_404(db, ticket_id)
-    return triage.run_auto_triage(db, ticket, actor=current_user)
+    return triage.run_auto_triage(db, ticket, actor=current_user, engine=engine)
