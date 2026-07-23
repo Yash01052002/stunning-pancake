@@ -1,4 +1,4 @@
-# Support Ticket System — Backend (Phases 1–5)
+# Support Ticket System — Backend (Phases 1–6)
 
 FastAPI + PostgreSQL API implementing ticket CRUD, comments, event logging,
 JWT auth with role-based access (admin/agent/customer), a rule-based
@@ -9,11 +9,14 @@ classifies category/sentiment/priority/confidence; low-confidence results
 route to human review instead of auto-assigning), SLA timers with
 escalation and notifications (Phase 4: per-(priority, tier) SLA policies,
 first-response/resolution clocks, breach escalation, and customer/agent
-notifications across in-app + email + Slack), and agent-productivity
-tooling (Phase 5: canned responses, LLM-drafted suggested replies, bulk
+notifications across in-app + email + Slack), agent-productivity tooling
+(Phase 5: canned responses, LLM-drafted suggested replies, bulk
 close/reassign, ticket merge, @mentions in internal notes, collision
-detection, and customer self-service KB deflection). Which triage engine
-runs is a config default, overridable per-ticket for A/B comparison.
+detection, and customer self-service KB deflection), and reporting,
+analytics & admin (Phase 6: CSAT ratings, volume / SLA-compliance / CSAT /
+agent-workload / triage-trend dashboards, CSV exports, and admin taxonomy /
+team management). Which triage engine runs is a config default, overridable
+per-ticket for A/B comparison.
 
 ## Stack
 
@@ -73,9 +76,11 @@ computation, first-response tracking, `sla_status` transitions, idempotent
 escalation with priority bump + reassignment, and notification scoping), and
 Phase 5 productivity (canned-response CRUD/filtering, suggested replies with a
 fake reply drafter, KB deflection ranking, bulk close/reassign, ticket merge,
-@mention notifications, and presence/collision detection). Email/Slack and the
-LLM reply drafter are never actually invoked over the network in tests — they
-no-op / are monkeypatched.
+@mention notifications, and presence/collision detection), and Phase 6
+reporting (CSAT validation/permissions, each report's math, CSV export shape,
+team rename, categories listing). Email/Slack and the LLM reply drafter are
+never actually invoked over the network in tests — they no-op / are
+monkeypatched.
 
 ## Data model
 
@@ -104,6 +109,8 @@ no-op / are monkeypatched.
     fresh
   - `merged_into_id` — set when the ticket is merged into another as a
     duplicate (the source is closed; points at the survivor)
+  - `csat_rating` (1–5) / `csat_comment` / `csat_submitted_at` — customer
+    satisfaction rating, submittable once the ticket is resolved/closed
 - `triage_rules` — ordered keyword rules (`keyword`, `category`, `priority`,
   `team_id`, `active`, `evaluation_order`); first active match wins for the
   rule engine, and the table doubles as the category→team map the LLM
@@ -275,6 +282,32 @@ resolved. Agents are notified on SLA escalation.
   incl. customers) returns KB articles whose keywords match a ticket draft,
   ranked by hit count — surfaced before a customer submits, to deflect.
 
+## Reporting, analytics & admin (Phase 6)
+
+- **CSAT** — `POST /tickets/{id}/csat` lets the ticket's own customer rate it
+  1–5 (+ optional comment) once it's resolved/closed.
+- **Dashboards** (all staff-only JSON, computed in `app/analytics.py`):
+  - `GET /reports/volume` — totals + counts by category / status / priority
+  - `GET /reports/sla-compliance` — met/breached/pending for both the
+    first-response and resolution clocks, with compliance rates. Reuses the
+    computed-on-read `*_sla_status` properties, so "breached" means exactly
+    what it does everywhere else.
+  - `GET /reports/csat` — response count, average, 1–5 distribution
+  - `GET /reports/agent-workload` — per-agent open / resolved / total assigned
+  - `GET /reports/triage-trend` — auto-triage success rate bucketed by day
+    (the accuracy-trend chart)
+  - `GET /reports/triage-accuracy` — the Phase 2 point-in-time metric (kept)
+  - `volume`, `sla-compliance`, `csat`, `triage-trend` accept
+    `created_from`/`created_to` ISO datetime filters.
+- **CSV export** (leadership) — `GET /reports/export/tickets.csv` (raw ticket
+  dump, date-filterable) and `GET /reports/export/volume.csv`
+  (volume-by-category), returned as `text/csv` attachments.
+- **Admin management** — routing rules (`/triage-rules`), SLA policies
+  (`/sla-policies`), and teams are all editable via the API without code
+  changes: `PATCH /teams/{id}` renames a team, and `GET /admin/categories`
+  shows the configured taxonomy alongside categories actually in use on
+  rules/tickets (drift detection).
+
 ## API surface
 
 | Method | Path | Notes |
@@ -286,10 +319,12 @@ resolved. Agents are notified on SLA escalation.
 | GET | `/users` | staff-only |
 | POST | `/teams` | admin-only |
 | GET | `/teams` | staff-only |
+| PATCH | `/teams/{id}` | admin-only: rename a team |
 | POST | `/tickets` | customer creates own; staff can create on behalf of a customer via `customer_id`. Auto-triage runs after the response is sent — the returned ticket reflects pre-triage state |
 | GET | `/tickets` | filterable list; customers see only their own tickets |
 | GET | `/tickets/{id}` | full detail incl. comments + event timeline |
 | PATCH | `/tickets/{id}` | staff-only: status/category/priority/assignment; marks the ticket `triage_method=manual` |
+| POST | `/tickets/{id}/csat` | customer-only (own, resolved/closed): submit a 1–5 satisfaction rating |
 | POST | `/tickets/{id}/triage?engine=` | staff-only: manually re-run auto-triage; optional `engine=rule\|llm` overrides the configured default for this call |
 | POST | `/tickets/{id}/comments` | customers restricted to public replies on their own ticket |
 | GET | `/tickets/{id}/comments` | internal notes hidden from customers |
@@ -316,6 +351,14 @@ resolved. Agents are notified on SLA escalation.
 | GET | `/kb-articles` | staff-only: list KB articles |
 | PATCH | `/kb-articles/{id}` | admin-only: edit/enable/disable |
 | POST | `/kb/suggest` | any authenticated user: KB articles matching a ticket draft |
+| GET | `/reports/volume` | staff-only: volume by category/status/priority (date-filterable) |
+| GET | `/reports/sla-compliance` | staff-only: first-response + resolution met/breached/pending |
+| GET | `/reports/csat` | staff-only: CSAT count/average/distribution |
+| GET | `/reports/agent-workload` | staff-only: per-agent open/resolved/total |
+| GET | `/reports/triage-trend` | staff-only: auto-triage success rate by day |
+| GET | `/reports/export/tickets.csv` | staff-only: raw ticket dump as CSV |
+| GET | `/reports/export/volume.csv` | staff-only: volume-by-category as CSV |
+| GET | `/admin/categories` | staff-only: configured vs. in-use categories |
 
 ### Triage accuracy report
 
@@ -362,6 +405,20 @@ becomes necessary.
   above. If regex is needed later, validate/sandbox patterns (e.g. a
   complexity check or a timeout-bounded matcher) before accepting
   admin-supplied ones.
+- **Taxonomy is config + free-form strings, not an editable Category table**
+  — categories live in `TRIAGE_CATEGORIES_CSV` (what the LLM classifies into)
+  and as free strings on rules/tickets. `GET /admin/categories` surfaces both
+  and flags drift, but there's no DB-backed category CRUD; "managing
+  taxonomy" today means editing the config + rules. A first-class `categories`
+  table with FK'd rules/tickets is the clean next step if the taxonomy needs
+  to be fully self-service-editable.
+- **Reports aggregate in Python, not via materialized rollups** — the Phase 6
+  dashboards query and count in-process (`app/analytics.py`), which is fine at
+  this scale and keeps "breached" defined in exactly one place (the
+  computed-on-read SLA properties). High ticket volume would want SQL
+  `GROUP BY` / a pre-aggregated reporting table or a read replica; the
+  analytics functions are the swap-in point. Report date filters are
+  normalized to naive-UTC to match SQLite storage (see `analytics._naive_utc`).
 - **Semantic similarity search is still keyword/category-based, not vector**
   — the master plan mentions "vector search over past tickets" for both
   duplicate detection and reply drafting. Two lightweight stand-ins are

@@ -6,7 +6,7 @@ Run after migrations: python -m scripts.seed
 from datetime import datetime, timedelta, timezone
 
 from app.database import SessionLocal
-from app.models import CustomerTier, TicketChannel, TicketPriority, UserRole
+from app.models import CustomerTier, TicketChannel, TicketPriority, TicketStatus, UserRole
 from app import crud, sla, triage
 
 
@@ -114,6 +114,14 @@ def run() -> None:
             actor=customer,
         )
         triage.run_auto_triage(db, matched_ticket)
+        # take it through the full lifecycle so the Phase 6 reports have data:
+        # first response (stops the FR clock), resolve, then a CSAT rating.
+        crud.add_comment(
+            db, matched_ticket, author=billing_agent,
+            body="Refund issued — you'll see it in 3-5 business days.", is_internal=False,
+        )
+        crud.update_ticket(db, matched_ticket, {"status": TicketStatus.RESOLVED}, actor=billing_agent)
+        crud.submit_csat(db, matched_ticket, rating=5, comment="Fast and friendly!", actor=customer)
 
         # unmatched: no rule matches, falls back to the Triage team for a human to categorize.
         unmatched_ticket = crud.create_ticket(
@@ -181,7 +189,7 @@ def run() -> None:
         print(
             f"  matched ticket:   {matched_ticket.id} -> "
             f"category={matched_ticket.category} priority={matched_ticket.priority} "
-            f"team={matched_ticket.assigned_team_id}"
+            f"team={matched_ticket.assigned_team_id} (resolved, CSAT={matched_ticket.csat_rating})"
         )
         print(
             f"  unmatched ticket: {unmatched_ticket.id} -> "
