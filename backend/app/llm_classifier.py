@@ -15,6 +15,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from app import pii
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,12 @@ class AnthropicLLMClassifier:
         except ImportError:
             logger.warning("anthropic package not installed; skipping LLM triage")
             return None
+
+        # redact PII before the text leaves for the external provider; the
+        # category/sentiment classification doesn't need literal identifiers.
+        # Structured outputs (output_format) constrain the response shape, which
+        # also blunts prompt-injection attempts in the ticket body.
+        subject, body = pii.redact(subject), pii.redact(body)
 
         try:
             client = anthropic.Anthropic()

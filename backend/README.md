@@ -1,4 +1,4 @@
-# Support Ticket System — Backend (Phases 1–6)
+# Support Ticket System — Backend (Phases 1–7)
 
 FastAPI + PostgreSQL API implementing ticket CRUD, comments, event logging,
 JWT auth with role-based access (admin/agent/customer), a rule-based
@@ -12,11 +12,14 @@ first-response/resolution clocks, breach escalation, and customer/agent
 notifications across in-app + email + Slack), agent-productivity tooling
 (Phase 5: canned responses, LLM-drafted suggested replies, bulk
 close/reassign, ticket merge, @mentions in internal notes, collision
-detection, and customer self-service KB deflection), and reporting,
-analytics & admin (Phase 6: CSAT ratings, volume / SLA-compliance / CSAT /
-agent-workload / triage-trend dashboards, CSV exports, and admin taxonomy /
-team management). Which triage engine runs is a config default, overridable
-per-ticket for A/B comparison.
+detection, and customer self-service KB deflection), reporting, analytics &
+admin (Phase 6: CSAT ratings, volume / SLA-compliance / CSAT / agent-workload
+/ triage-trend dashboards, CSV exports, and admin taxonomy / team management),
+and hardening (Phase 7: PII redaction + prompt-injection resistance before LLM
+calls, per-IP rate limiting on public endpoints, and append-only audit
+logging — plus an ops/security runbook at [`docs/runbook.md`](../docs/runbook.md)).
+Which triage engine runs is a config default, overridable per-ticket for A/B
+comparison.
 
 ## Stack
 
@@ -76,11 +79,14 @@ computation, first-response tracking, `sla_status` transitions, idempotent
 escalation with priority bump + reassignment, and notification scoping), and
 Phase 5 productivity (canned-response CRUD/filtering, suggested replies with a
 fake reply drafter, KB deflection ranking, bulk close/reassign, ticket merge,
-@mention notifications, and presence/collision detection), and Phase 6
+@mention notifications, and presence/collision detection), Phase 6
 reporting (CSAT validation/permissions, each report's math, CSV export shape,
-team rename, categories listing). Email/Slack and the LLM reply drafter are
-never actually invoked over the network in tests — they no-op / are
-monkeypatched.
+team rename, categories listing), and Phase 7 hardening (PII redaction,
+prompt fencing, rate limiting, and audit logging). Email/Slack and the LLM
+reply drafter are never actually invoked over the network in tests — they
+no-op / are monkeypatched. Rate limiting is disabled by default in the suite
+via an autouse fixture (it's process-global state); the dedicated rate-limit
+tests enable it explicitly.
 
 ## Data model
 
@@ -127,8 +133,11 @@ monkeypatched.
 - `ticket_presence` — one heartbeat row per (ticket, staff viewer) for
   collision detection; unique on `(ticket_id, user_id)`
 - `comments` (public replies vs. internal-only notes)
-- `ticket_events` — append-only audit log; every create/update/comment/
-  auto-triage/sla_escalated/merge action is recorded here
+- `ticket_events` — append-only *business* audit log; every create/update/
+  comment/auto-triage/sla_escalated/merge/csat action is recorded here
+- `audit_logs` — append-only *security* audit log (Phase 7): one row per
+  state-changing HTTP request (actor / method / path / status / IP), written
+  by middleware; stores no request bodies
 
 ## Auto-triage
 
@@ -186,8 +195,10 @@ for human triage, or left unassigned if that team doesn't exist.
 **Why BackgroundTasks and not a queue (Celery/RQ + Redis):** the master
 plan's "async job pipeline" is satisfied at this scale by FastAPI's
 built-in BackgroundTasks — it decouples triage from the request/response
-without adding new infra. Revisit this in Phase 7 (Hardening & Scale) if
-ticket volume needs a real worker queue with retries/backpressure.
+without adding new infra. The swap point for a real worker queue with
+retries/backpressure (Celery/RQ/Arq + Redis) is
+`tickets._run_triage_in_background`; see `docs/runbook.md` → "Scale & load
+testing" for when to make that move.
 
 **A/B comparison between engines:** set `AUTO_TRIAGE_ENGINE=llm` to make it
 the default, or leave it on `rule` and use `POST /tickets/{id}/triage?engine=llm`
@@ -308,6 +319,37 @@ resolved. Agents are notified on SLA escalation.
   shows the configured taxonomy alongside categories actually in use on
   rules/tickets (drift detection).
 
+## Hardening, scale & compliance (Phase 7)
+
+Defense-in-depth around the LLM integration, public endpoints, and the audit
+trail. The parts that are process/infra rather than code (retention, backups,
+load testing, on-call) live in the ops/security runbook at
+[`docs/runbook.md`](../docs/runbook.md); what's implemented in code:
+
+- **PII redaction before LLM egress** (`app/pii.py`) — ticket subject/body is
+  scrubbed of email / phone / card- & SSN-shaped numbers before it's sent to
+  Anthropic by either the triage classifier (`app/llm_classifier.py`) or the
+  reply drafter (`app/reply_drafter.py`). Regex-based, so it's defense-in-depth
+  (false negatives possible), not a guarantee — extend the patterns per the PII
+  classes a given deployment handles.
+- **Prompt-injection resistance** — the reply drafter fences the ticket (and
+  each similar-ticket context block) in labeled *untrusted* delimiters and the
+  system prompt instructs the model to treat that content as data, never
+  instructions. The classifier uses structured outputs, which constrains the
+  response shape regardless of what the ticket text says.
+- **Rate limiting** (`app/rate_limit.py`) — per-IP fixed-window limits on the
+  abuse-prone public endpoints (`POST /tickets`, `/auth/register`,
+  `/auth/login`); returns `429` with a `Retry-After` header once a bucket is
+  spent. Tunable via `RATE_LIMIT_*` (see `.env.example`); off when
+  `RATE_LIMIT_ENABLED=false`.
+- **Audit logging** (`app/audit.py`) — a middleware records one append-only
+  `audit_logs` row per state-changing request (POST/PATCH/PUT/DELETE): actor
+  (decoded from the bearer token, or null on a failed auth), method, path,
+  status code, and client IP. **No request bodies are stored**, so
+  credentials/PII don't accumulate in the trail. `GET /admin/audit-logs`
+  (admin-only) reads it back, newest first. Auditing is wrapped so it can never
+  break the underlying request.
+
 ## API surface
 
 | Method | Path | Notes |
@@ -359,6 +401,7 @@ resolved. Agents are notified on SLA escalation.
 | GET | `/reports/export/tickets.csv` | staff-only: raw ticket dump as CSV |
 | GET | `/reports/export/volume.csv` | staff-only: volume-by-category as CSV |
 | GET | `/admin/categories` | staff-only: configured vs. in-use categories |
+| GET | `/admin/audit-logs` | admin-only: security audit trail, newest first (optional `actor_id` filter) |
 
 ### Triage accuracy report
 
@@ -443,3 +486,16 @@ becomes necessary.
   The test suite never calls the real API; it injects fakes via
   `monkeypatch.setattr(triage, "get_classifier", ...)` /
   `monkeypatch.setattr(tickets_router, "get_drafter", ...)`.
+- **Rate limiting is per-process, not shared** — `app/rate_limit.py` is an
+  in-memory fixed-window limiter, so with `W` workers the effective ceiling is
+  `W × configured` and counters reset on restart. It's a first line of defense;
+  production should front it with a shared limiter (Redis-backed, an API
+  gateway, or a WAF/CDN rate limit on the public ingress) and keep the in-app
+  limiter as a backstop. See `docs/runbook.md` → "Rate limiting & abuse
+  protection".
+- **PII redaction is best-effort** — `app/pii.py` masks common email / phone /
+  card / SSN shapes via regex before any ticket text reaches the LLM provider,
+  but regex has false negatives and doesn't cover names/addresses/free-form
+  identifiers. Treat it as defense-in-depth and extend the patterns for the PII
+  classes a given deployment actually handles; it is not a substitute for a
+  full DLP review.

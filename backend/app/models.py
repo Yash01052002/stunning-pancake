@@ -387,3 +387,24 @@ class TicketPresence(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     user: Mapped[User] = relationship(foreign_keys=[user_id])
+
+
+class AuditLog(Base):
+    """Phase 7: append-only security audit trail of state-changing requests.
+
+    Recorded centrally by middleware for every mutating request (POST/PATCH/
+    PUT/DELETE) — who (actor, from the bearer token when present), what
+    (method + path), the outcome (status code), and where from (client IP).
+    Deliberately does NOT store request bodies, so credentials/PII don't leak
+    into the audit table itself. `actor_id` is a plain string (not an FK) so a
+    log entry survives the referenced user being deleted."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    actor_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    method: Mapped[str] = mapped_column(String, nullable=False)
+    path: Mapped[str] = mapped_column(String, nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    client_ip: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)

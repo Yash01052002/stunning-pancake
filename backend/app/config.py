@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # reply drafter as "here's how we handled similar ones" context
     reply_draft_similar_limit: int = 3
 
+    # Phase 7: abuse protection (per-process fixed-window; see app/rate_limit.py)
+    rate_limit_enabled: bool = True
+    rate_limit_ticket_create_per_minute: int = 60
+    rate_limit_auth_per_minute: int = 20
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

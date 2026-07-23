@@ -429,3 +429,18 @@ class TriageTrendReport(BaseModel):
 class CategoriesReport(BaseModel):
     configured: list[str]  # from settings.triage_categories (what the LLM classifies into)
     in_use: list[str]  # distinct categories actually present on rules and tickets
+
+
+# ---- Audit logs (Phase 7) ----
+
+
+class AuditLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    actor_id: str | None
+    method: str
+    path: str
+    status_code: int
+    client_ip: str | None
+    created_at: datetime

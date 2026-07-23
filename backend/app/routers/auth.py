@@ -2,16 +2,25 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app import crud
+from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import User, UserRole
+from app.rate_limit import rate_limit
 from app.schemas import LoginRequest, TokenResponse, UserCreate, UserRead
 from app.security import create_access_token, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_auth_rate_limit = rate_limit("auth", lambda: settings.rate_limit_auth_per_minute)
 
-@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/register",
+    response_model=UserRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_auth_rate_limit],
+)
 def register(payload: UserCreate, db: Session = Depends(get_db)):
     """Public self-service signup. Always creates a CUSTOMER account —
     staff accounts (agent/admin) are created via POST /users by an admin."""
@@ -29,7 +38,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
     return user
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[_auth_rate_limit])
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = crud.get_user_by_email(db, payload.email)
     if not user or not verify_password(payload.password, user.hashed_password):

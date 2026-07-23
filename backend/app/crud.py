@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from app import notifications, sla
 from app.models import (
+    AuditLog,
     CannedResponse,
     Comment,
     KBArticle,
@@ -311,6 +312,16 @@ def mark_notification_read(db: Session, notification: Notification) -> Notificat
         db.commit()
         db.refresh(notification)
     return notification
+
+
+# ---- Audit logs (Phase 7) ----
+
+
+def list_audit_logs(db: Session, limit: int = 100, actor_id: str | None = None) -> list[AuditLog]:
+    stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
+    if actor_id is not None:
+        stmt = stmt.where(AuditLog.actor_id == actor_id)
+    return list(db.scalars(stmt))
 
 
 # ---- Canned responses (Phase 5) ----
