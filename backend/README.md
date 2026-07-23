@@ -1,4 +1,4 @@
-# Support Ticket System — Backend (Phases 1–4)
+# Support Ticket System — Backend (Phases 1–5)
 
 FastAPI + PostgreSQL API implementing ticket CRUD, comments, event logging,
 JWT auth with role-based access (admin/agent/customer), a rule-based
@@ -6,11 +6,14 @@ auto-triage engine (Phase 2: keyword rules → category/priority/team,
 tier-based priority boost, load-based agent assignment, fallback queue for
 unmatched tickets), an LLM-based auto-triage engine (Phase 3: Claude
 classifies category/sentiment/priority/confidence; low-confidence results
-route to human review instead of auto-assigning), and SLA timers with
+route to human review instead of auto-assigning), SLA timers with
 escalation and notifications (Phase 4: per-(priority, tier) SLA policies,
 first-response/resolution clocks, breach escalation, and customer/agent
-notifications across in-app + email + Slack). Which triage engine runs is a
-config default, overridable per-ticket for A/B comparison.
+notifications across in-app + email + Slack), and agent-productivity
+tooling (Phase 5: canned responses, LLM-drafted suggested replies, bulk
+close/reassign, ticket merge, @mentions in internal notes, collision
+detection, and customer self-service KB deflection). Which triage engine
+runs is a config default, overridable per-ticket for A/B comparison.
 
 ## Stack
 
@@ -67,9 +70,12 @@ override tracking, accuracy reporting), the LLM engine (a fake classifier is
 injected via `monkeypatch` — no `ANTHROPIC_API_KEY` or network access
 needed), and Phase 4 SLA/escalation/notifications (policy precedence, due-date
 computation, first-response tracking, `sla_status` transitions, idempotent
-escalation with priority bump + reassignment, and notification scoping).
-Email/Slack are never actually sent in tests — they no-op because no SMTP
-host / Slack webhook is configured.
+escalation with priority bump + reassignment, and notification scoping), and
+Phase 5 productivity (canned-response CRUD/filtering, suggested replies with a
+fake reply drafter, KB deflection ranking, bulk close/reassign, ticket merge,
+@mention notifications, and presence/collision detection). Email/Slack and the
+LLM reply drafter are never actually invoked over the network in tests — they
+no-op / are monkeypatched.
 
 ## Data model
 
@@ -96,6 +102,8 @@ host / Slack webhook is configured.
     read** (not stored): `on_track`/`at_risk`/`breached`/`met`/`breached_late`,
     so a breach is always visible without a background job keeping a column
     fresh
+  - `merged_into_id` — set when the ticket is merged into another as a
+    duplicate (the source is closed; points at the survivor)
 - `triage_rules` — ordered keyword rules (`keyword`, `category`, `priority`,
   `team_id`, `active`, `evaluation_order`); first active match wins for the
   rule engine, and the table doubles as the category→team map the LLM
@@ -104,10 +112,16 @@ host / Slack webhook is configured.
   `(priority, tier)`; a tier-specific policy beats a `tier=null` one for the
   same priority
 - `notifications` — in-app notifications (always created); one row per
-  recipient per event
+  recipient per event (`type` includes `mentioned` for @-mentions)
+- `canned_responses` — reusable reply snippets; optional `category` scopes a
+  snippet to matching tickets (null = offered on every ticket)
+- `kb_articles` — knowledge-base articles for self-service deflection, matched
+  by comma-separated `keywords`
+- `ticket_presence` — one heartbeat row per (ticket, staff viewer) for
+  collision detection; unique on `(ticket_id, user_id)`
 - `comments` (public replies vs. internal-only notes)
 - `ticket_events` — append-only audit log; every create/update/comment/
-  auto-triage/sla_escalated action is recorded here
+  auto-triage/sla_escalated/merge action is recorded here
 
 ## Auto-triage
 
@@ -234,6 +248,33 @@ Three channels, degrading gracefully:
 Customers are notified on ticket received, in-progress (status → open), and
 resolved. Agents are notified on SLA escalation.
 
+## Agent productivity (Phase 5)
+
+- **Canned responses** — reusable snippets (`/canned-responses`, admin CRUD /
+  staff read). A snippet's optional `category` scopes it to matching tickets.
+- **Suggested replies** — `GET /tickets/{id}/suggested-replies` returns
+  category-relevant canned responses plus an optional LLM-drafted reply
+  (`app/reply_drafter.py`) grounded in a few recent resolved tickets in the
+  same category. Same graceful-degradation contract as the Phase 3
+  classifier: no `ANTHROPIC_API_KEY` / any failure → `drafted_reply` is
+  simply `null`, canned responses still return. `?draft=false` skips the LLM
+  call entirely. The draft is always for an agent to review — never
+  auto-sent.
+- **Bulk actions & merge** — `POST /tickets/bulk/close`,
+  `POST /tickets/bulk/reassign`, and `POST /tickets/{id}/merge` (marks the
+  given sources duplicates of this ticket and closes them). Bulk ops reuse
+  the single-ticket update path per row so SLA recompute + notifications stay
+  consistent; unknown ids are skipped.
+- **@mentions** — an `@email` in an **internal** note notifies that staff
+  member (`mentioned` notification). Public replies never trigger mentions,
+  and customers can't be mentioned (internal-collaboration only).
+- **Collision detection** — `POST /tickets/{id}/presence` is a heartbeat that
+  returns the other agents currently viewing the ticket (seen within
+  `PRESENCE_WINDOW_SECONDS`); `GET` lists them without registering the caller.
+- **Self-service deflection** — `POST /kb/suggest` (any authenticated user,
+  incl. customers) returns KB articles whose keywords match a ticket draft,
+  ranked by hit count — surfaced before a customer submits, to deflect.
+
 ## API surface
 
 | Method | Path | Notes |
@@ -262,6 +303,19 @@ resolved. Agents are notified on SLA escalation.
 | POST | `/sla/escalate` | staff-only: run the idempotent breach-escalation sweep |
 | GET | `/notifications` | current user's notifications, newest first |
 | PATCH | `/notifications/{id}/read` | mark one of your own notifications read |
+| POST | `/canned-responses` | admin-only: create a canned response |
+| GET | `/canned-responses?category=` | staff-only: list (optionally category-filtered) |
+| PATCH | `/canned-responses/{id}` | admin-only: edit/enable/disable |
+| GET | `/tickets/{id}/suggested-replies?draft=` | staff-only: canned + LLM-drafted reply |
+| POST | `/tickets/bulk/close` | staff-only: bulk close by id list |
+| POST | `/tickets/bulk/reassign` | staff-only: bulk set agent and/or team |
+| POST | `/tickets/{id}/merge` | staff-only: merge source tickets into this one |
+| POST | `/tickets/{id}/presence` | staff-only: heartbeat; returns other active viewers |
+| GET | `/tickets/{id}/presence` | staff-only: list active viewers (no self-register) |
+| POST | `/kb-articles` | admin-only: create a KB article |
+| GET | `/kb-articles` | staff-only: list KB articles |
+| PATCH | `/kb-articles/{id}` | admin-only: edit/enable/disable |
+| POST | `/kb/suggest` | any authenticated user: KB articles matching a ticket draft |
 
 ### Triage accuracy report
 
@@ -308,17 +362,27 @@ becomes necessary.
   above. If regex is needed later, validate/sandbox patterns (e.g. a
   complexity check or a timeout-bounded matcher) before accepting
   admin-supplied ones.
-- **Duplicate/similar-ticket detection** (Phase 3 master-plan item: "vector
-  search over past tickets ... to suggest existing solutions") is **not
-  implemented yet**. This pass focused on the classifier itself (category/
-  sentiment/priority/confidence) and confidence-gated routing. Adding
-  similarity search is a reasonable next slice — it doesn't need pgvector
-  or a hosted embeddings API to start (Anthropic doesn't offer one; the
-  usual pairing is Voyage AI); a lightweight local bag-of-words cosine
-  similarity over recent tickets would work for v1 at this scale.
-- **LLM engine requires `ANTHROPIC_API_KEY`** to actually classify anything.
-  Without it (or on any network/API failure), `classify()` returns `None`
-  and the ticket is routed to the fallback team exactly like an unmatched
-  rule — this is by design (see "LLM engine" above), not an error path that
-  needs fixing. The test suite never calls the real API; it injects a fake
-  classifier via `monkeypatch.setattr(triage, "get_classifier", ...)`.
+- **Semantic similarity search is still keyword/category-based, not vector**
+  — the master plan mentions "vector search over past tickets" for both
+  duplicate detection and reply drafting. Two lightweight stand-ins are
+  implemented: the reply drafter's "similar resolved tickets" is *recent
+  resolved tickets in the same category* (`crud.find_similar_resolved_tickets`),
+  and KB deflection is *comma-separated keyword substring matching*
+  (`crud.suggest_kb_articles`). Both are sufficient at this scale and need no
+  extra infra. True semantic similarity (embeddings + pgvector, typically
+  paired with Voyage AI since Anthropic has no embeddings endpoint) is the
+  next slice — the two `crud` functions are the natural swap-in points.
+- **Ticket merge is one-way and shallow** — merging sets `merged_into_id` and
+  closes the source; it does **not** move the source's comments/attachments
+  onto the survivor or de-duplicate customers. That's fine for flagging
+  duplicates but a fuller merge (re-parenting history) would build on the
+  same endpoint.
+- **The LLM features require `ANTHROPIC_API_KEY`** to do anything — both the
+  Phase 3 triage classifier and the Phase 5 reply drafter. Without it (or on
+  any network/API failure) each returns `None` and the caller degrades
+  gracefully: triage routes to the fallback team like an unmatched rule, and
+  `suggested-replies` returns `drafted_reply: null` while still returning
+  canned responses. This is by design, not an error path that needs fixing.
+  The test suite never calls the real API; it injects fakes via
+  `monkeypatch.setattr(triage, "get_classifier", ...)` /
+  `monkeypatch.setattr(tickets_router, "get_drafter", ...)`.

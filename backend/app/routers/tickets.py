@@ -4,10 +4,24 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app import crud, database, triage
+from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_staff
 from app.models import Ticket, TicketPriority, TicketStatus, User, UserRole
-from app.schemas import TicketCreate, TicketDetailRead, TicketRead, TicketUpdate
+from app.reply_drafter import SimilarTicket, get_drafter
+from app.schemas import (
+    BulkActionResult,
+    BulkCloseRequest,
+    BulkReassignRequest,
+    CannedResponseRead,
+    MergeRequest,
+    PresenceRead,
+    SuggestedReplies,
+    TicketCreate,
+    TicketDetailRead,
+    TicketRead,
+    TicketUpdate,
+)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -134,3 +148,112 @@ def retrigger_triage(
     """
     ticket = _get_ticket_or_404(db, ticket_id)
     return triage.run_auto_triage(db, ticket, actor=current_user, engine=engine)
+
+
+# ---- Phase 5: agent productivity ----
+
+
+@router.post("/bulk/close", response_model=BulkActionResult)
+def bulk_close(
+    payload: BulkCloseRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    updated = crud.bulk_update_tickets(
+        db, payload.ticket_ids, {"status": TicketStatus.CLOSED}, actor=current_user
+    )
+    return BulkActionResult(updated_ticket_ids=updated, updated_count=len(updated))
+
+
+@router.post("/bulk/reassign", response_model=BulkActionResult)
+def bulk_reassign(
+    payload: BulkReassignRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    updates: dict = {}
+    if payload.assigned_agent_id is not None:
+        updates["assigned_agent_id"] = payload.assigned_agent_id
+    if payload.assigned_team_id is not None:
+        updates["assigned_team_id"] = payload.assigned_team_id
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide assigned_agent_id and/or assigned_team_id",
+        )
+    updated = crud.bulk_update_tickets(db, payload.ticket_ids, updates, actor=current_user)
+    return BulkActionResult(updated_ticket_ids=updated, updated_count=len(updated))
+
+
+@router.get("/{ticket_id}/suggested-replies", response_model=SuggestedReplies)
+def suggested_replies(
+    ticket_id: str,
+    draft: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    """Canned responses relevant to this ticket, plus an optional LLM-drafted
+    reply grounded in similar resolved tickets. `draft=false` skips the LLM
+    call; when the drafter is unavailable, drafted_reply is simply null."""
+    ticket = _get_ticket_or_404(db, ticket_id)
+    canned = crud.list_canned_responses(db, category=ticket.category)
+    similar = crud.find_similar_resolved_tickets(db, ticket, settings.reply_draft_similar_limit)
+
+    drafted_reply = None
+    if draft:
+        drafted_reply = get_drafter().draft_reply(
+            ticket.subject,
+            ticket.body,
+            [SimilarTicket(subject=t.subject, body=t.body, resolution=res) for t, res in similar],
+        )
+
+    return SuggestedReplies(
+        canned=[CannedResponseRead.model_validate(c) for c in canned],
+        drafted_reply=drafted_reply,
+        similar_ticket_ids=[t.id for t, _ in similar],
+    )
+
+
+@router.post("/{ticket_id}/merge", response_model=TicketRead)
+def merge_tickets(
+    ticket_id: str,
+    payload: MergeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    """Merge the given source tickets INTO this one (marks each source a
+    duplicate: sets merged_into_id and closes it)."""
+    target = _get_ticket_or_404(db, ticket_id)
+    crud.merge_tickets(db, target, payload.source_ticket_ids, actor=current_user)
+    return target
+
+
+@router.post("/{ticket_id}/presence", response_model=list[PresenceRead])
+def heartbeat_presence(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    """Register/refresh this agent's presence on the ticket (collision
+    detection heartbeat) and return the OTHER agents currently viewing it."""
+    _get_ticket_or_404(db, ticket_id)
+    crud.touch_presence(db, ticket_id, current_user.id)
+    others = crud.list_active_presence(
+        db, ticket_id, settings.presence_window_seconds, exclude_user_id=current_user.id
+    )
+    return [PresenceRead.model_validate(p) for p in others]
+
+
+@router.get("/{ticket_id}/presence", response_model=list[PresenceRead])
+def list_presence(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    """Agents currently viewing this ticket (excluding the caller), without
+    registering the caller's own presence."""
+    _get_ticket_or_404(db, ticket_id)
+    others = crud.list_active_presence(
+        db, ticket_id, settings.presence_window_seconds, exclude_user_id=current_user.id
+    )
+    return [PresenceRead.model_validate(p) for p in others]

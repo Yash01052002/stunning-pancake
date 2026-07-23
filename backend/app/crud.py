@@ -3,19 +3,25 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from datetime import timedelta
+
 from app import notifications, sla
 from app.models import (
+    CannedResponse,
     Comment,
+    KBArticle,
     Notification,
     SLAPolicy,
     Team,
     Ticket,
     TicketEvent,
+    TicketPresence,
     TicketStatus,
     TriageMethod,
     TriageRule,
     User,
     UserRole,
+    as_aware_utc,
 )
 from app.security import hash_password
 
@@ -185,6 +191,11 @@ def add_comment(
     if is_first_response:
         ticket.first_responded_at = _now()
 
+    # @mentions are an internal-collaboration feature — only parsed on internal
+    # notes (a customer-visible reply shouldn't quietly ping staff)
+    if is_internal:
+        notifications.notify_mentions(db, ticket, author, body)
+
     log_event(
         db,
         ticket,
@@ -276,3 +287,199 @@ def mark_notification_read(db: Session, notification: Notification) -> Notificat
         db.commit()
         db.refresh(notification)
     return notification
+
+
+# ---- Canned responses (Phase 5) ----
+
+
+def create_canned_response(db: Session, **fields) -> CannedResponse:
+    canned = CannedResponse(**fields)
+    db.add(canned)
+    db.commit()
+    db.refresh(canned)
+    return canned
+
+
+def list_canned_responses(db: Session, category: str | None = None) -> list[CannedResponse]:
+    """Active responses whose category is null (applies to all) or matches the
+    given category. With category=None, returns every active response."""
+    stmt = select(CannedResponse).where(CannedResponse.active == True)  # noqa: E712
+    if category is not None:
+        stmt = stmt.where(
+            (CannedResponse.category.is_(None)) | (CannedResponse.category == category)
+        )
+    return list(db.scalars(stmt.order_by(CannedResponse.title)))
+
+
+def get_canned_response(db: Session, canned_id: str) -> CannedResponse | None:
+    return db.get(CannedResponse, canned_id)
+
+
+def update_canned_response(db: Session, canned: CannedResponse, updates: dict) -> CannedResponse:
+    for field, value in updates.items():
+        if value is not None:
+            setattr(canned, field, value)
+    db.commit()
+    db.refresh(canned)
+    return canned
+
+
+def find_similar_resolved_tickets(
+    db: Session, ticket: Ticket, limit: int
+) -> list[tuple[Ticket, str]]:
+    """Recent resolved/closed tickets in the same category (excluding this one),
+    each paired with its last public agent reply as the 'resolution'. This is
+    the lightweight keyword-free stand-in for vector similarity — see the
+    Phase 5 deflection/similarity note in the README. Returns [] if the ticket
+    has no category yet."""
+    if ticket.category is None:
+        return []
+    rows = db.scalars(
+        select(Ticket)
+        .where(
+            Ticket.category == ticket.category,
+            Ticket.id != ticket.id,
+            Ticket.status.in_((TicketStatus.RESOLVED, TicketStatus.CLOSED)),
+        )
+        .order_by(Ticket.resolved_at.desc().nullslast(), Ticket.updated_at.desc())
+        .limit(limit)
+    )
+    results: list[tuple[Ticket, str]] = []
+    for past in rows:
+        resolution = next(
+            (
+                c.body
+                for c in reversed(past.comments)
+                if not c.is_internal and c.author and c.author.role != UserRole.CUSTOMER
+            ),
+            "",
+        )
+        results.append((past, resolution))
+    return results
+
+
+# ---- KB articles (Phase 5) ----
+
+
+def create_kb_article(db: Session, **fields) -> KBArticle:
+    article = KBArticle(**fields)
+    db.add(article)
+    db.commit()
+    db.refresh(article)
+    return article
+
+
+def list_kb_articles(db: Session) -> list[KBArticle]:
+    return list(db.scalars(select(KBArticle).order_by(KBArticle.title)))
+
+
+def get_kb_article(db: Session, article_id: str) -> KBArticle | None:
+    return db.get(KBArticle, article_id)
+
+
+def update_kb_article(db: Session, article: KBArticle, updates: dict) -> KBArticle:
+    for field, value in updates.items():
+        if value is not None:
+            setattr(article, field, value)
+    db.commit()
+    db.refresh(article)
+    return article
+
+
+def suggest_kb_articles(db: Session, text: str, limit: int = 5) -> list[KBArticle]:
+    """Deflection: active articles with any comma-separated keyword appearing
+    (case-insensitive substring) in the customer's draft text. Ranked by number
+    of distinct keyword hits. Plain matching, no index — sufficient at this
+    scale (see README)."""
+    haystack = text.lower()
+    scored: list[tuple[int, KBArticle]] = []
+    for article in db.scalars(select(KBArticle).where(KBArticle.active == True)):  # noqa: E712
+        keywords = [k.strip().lower() for k in article.keywords.split(",") if k.strip()]
+        hits = sum(1 for k in keywords if k in haystack)
+        if hits:
+            scored.append((hits, article))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [article for _, article in scored[:limit]]
+
+
+# ---- Bulk actions & merge (Phase 5) ----
+
+
+def bulk_update_tickets(db: Session, ticket_ids: list[str], updates: dict, actor: User) -> list[str]:
+    """Applies the same field updates to many tickets in one commit, logging a
+    per-ticket event and (for status changes) firing customer notifications —
+    reuses the single-ticket update_ticket semantics by calling it per row so
+    SLA recompute / notification side effects stay consistent. Unknown ticket
+    ids are silently skipped; returns the ids actually updated."""
+    updated: list[str] = []
+    for ticket_id in ticket_ids:
+        ticket = db.get(Ticket, ticket_id)
+        if ticket is None:
+            continue
+        update_ticket(db, ticket, dict(updates), actor)
+        updated.append(ticket_id)
+    return updated
+
+
+def merge_tickets(db: Session, target: Ticket, source_ids: list[str], actor: User) -> list[str]:
+    """Marks each source as a duplicate of `target`: sets merged_into_id,
+    closes it, and logs events on both sides. Skips ids that don't exist, are
+    the target itself, or are already merged. Returns the ids actually merged."""
+    merged: list[str] = []
+    for source_id in source_ids:
+        if source_id == target.id:
+            continue
+        source = db.get(Ticket, source_id)
+        if source is None or source.merged_into_id is not None:
+            continue
+        source.merged_into_id = target.id
+        source.status = TicketStatus.CLOSED
+        log_event(db, source, "merged_into", actor, {"target_ticket_id": target.id})
+        log_event(db, target, "merge_received", actor, {"source_ticket_id": source_id})
+        merged.append(source_id)
+    if merged:
+        db.commit()
+        db.refresh(target)
+    return merged
+
+
+# ---- Presence / collision detection (Phase 5) ----
+
+
+def touch_presence(db: Session, ticket_id: str, user_id: str) -> TicketPresence:
+    """Upsert this (ticket, user) heartbeat to now. One row per pair via the
+    unique constraint — find-or-create rather than relying on a DB upsert so
+    it's portable across SQLite and Postgres."""
+    presence = db.scalar(
+        select(TicketPresence).where(
+            TicketPresence.ticket_id == ticket_id, TicketPresence.user_id == user_id
+        )
+    )
+    if presence is None:
+        presence = TicketPresence(ticket_id=ticket_id, user_id=user_id, last_seen_at=_now())
+        db.add(presence)
+    else:
+        presence.last_seen_at = _now()
+    db.commit()
+    db.refresh(presence)
+    return presence
+
+
+def list_active_presence(
+    db: Session, ticket_id: str, window_seconds: int, exclude_user_id: str | None = None
+) -> list[TicketPresence]:
+    """Presence rows for a ticket seen within the recent window (i.e. viewers
+    currently on it), optionally excluding the caller so they only see *others*."""
+    cutoff = _now() - timedelta(seconds=window_seconds)
+    rows = db.scalars(
+        select(TicketPresence)
+        .where(TicketPresence.ticket_id == ticket_id)
+        .order_by(TicketPresence.last_seen_at.desc())
+    )
+    active = []
+    for row in rows:
+        if exclude_user_id is not None and row.user_id == exclude_user_id:
+            continue
+        if as_aware_utc(row.last_seen_at) >= cutoff:
+            active.append(row)
+    return active

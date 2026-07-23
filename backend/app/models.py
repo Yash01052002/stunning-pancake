@@ -2,7 +2,18 @@ import enum
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, JSON, String, Text, Boolean
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.config import settings
@@ -159,6 +170,9 @@ class Ticket(Base):
         DateTime(timezone=True), nullable=True
     )
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Phase 5: set when this ticket is merged into another (a duplicate). The
+    # source is closed; merged_into_id points at the survivor. Self-referential.
+    merged_into_id: Mapped[str | None] = mapped_column(ForeignKey("tickets.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -168,6 +182,9 @@ class Ticket(Base):
     customer: Mapped[User] = relationship(foreign_keys=[customer_id])
     assigned_agent: Mapped[User | None] = relationship(foreign_keys=[assigned_agent_id])
     assigned_team: Mapped[Team | None] = relationship(foreign_keys=[assigned_team_id])
+    merged_into: Mapped["Ticket | None"] = relationship(
+        remote_side=[id], foreign_keys=[merged_into_id]
+    )
     comments: Mapped[list["Comment"]] = relationship(
         back_populates="ticket", cascade="all, delete-orphan", order_by="Comment.created_at"
     )
@@ -295,6 +312,7 @@ class NotificationType(str, enum.Enum):
     TICKET_RESOLVED = "ticket_resolved"
     SLA_AT_RISK = "sla_at_risk"
     SLA_ESCALATED = "sla_escalated"
+    MENTIONED = "mentioned"  # Phase 5: @-mentioned in an internal note
 
 
 class Notification(Base):
@@ -317,3 +335,51 @@ class Notification(Base):
 
     user: Mapped[User] = relationship(foreign_keys=[user_id])
     ticket: Mapped[Ticket | None] = relationship(foreign_keys=[ticket_id])
+
+
+class CannedResponse(Base):
+    """Reusable reply snippet staff can insert. Optional `category` scopes a
+    snippet to matching tickets (e.g. only surface billing macros on billing
+    tickets); a null category means it's offered on every ticket."""
+
+    __tablename__ = "canned_responses"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class KBArticle(Base):
+    """Knowledge-base article for customer self-service deflection. `keywords`
+    is a simple comma-separated list matched (case-insensitive substring)
+    against a ticket draft's subject+body — no full-text/vector index at this
+    scale; see the deflection note in the README."""
+
+    __tablename__ = "kb_articles"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords: Mapped[str] = mapped_column(String, nullable=False, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class TicketPresence(Base):
+    """Collision detection: a heartbeat row per (ticket, staff viewer). Agents
+    POST to refresh last_seen_at while a ticket is open in their UI; the
+    presence list filters to rows seen within a recent window so two agents
+    working the same ticket can see each other. One row per pair (upserted)."""
+
+    __tablename__ = "ticket_presence"
+    __table_args__ = (UniqueConstraint("ticket_id", "user_id", name="uq_presence_ticket_user"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    ticket_id: Mapped[str] = mapped_column(ForeignKey("tickets.id"), nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
