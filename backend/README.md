@@ -46,6 +46,22 @@ outcomes) once the stack is up:
 docker compose exec api python -m scripts.seed
 ```
 
+## Console walkthrough (no server needed)
+
+To watch the whole system work end-to-end in your terminal — every phase,
+driven through the real service/CRUD code on a throwaway in-memory SQLite DB,
+no Postgres / server / API key required:
+
+```bash
+cd backend
+python -m scripts.demo
+```
+
+It prints each phase's outcome (triage routing, SLA escalation, notifications,
+merge/@mentions, reports, PII redaction, audit log). The LLM features fall back
+to a clearly-labelled offline stub when `ANTHROPIC_API_KEY` isn't set, so the
+routing logic stays visible. It's a guided tour, not production code.
+
 ## Run locally without Docker
 
 ```bash
