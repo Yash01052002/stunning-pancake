@@ -4,10 +4,22 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import crud, database
+from app import crud, database, rate_limit
+from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import CustomerTier, UserRole
+
+
+@pytest.fixture(autouse=True)
+def _disable_rate_limiting(monkeypatch):
+    """Phase 7 rate limiting is process-global state; keep it off for the bulk
+    of the suite so tests aren't coupled to its counters. The dedicated
+    rate-limit tests re-enable it explicitly and reset the store."""
+    monkeypatch.setattr(settings, "rate_limit_enabled", False)
+    rate_limit.reset()
+    yield
+    rate_limit.reset()
 
 
 @pytest.fixture()

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.audit import audit_middleware
 from app.routers import (
     admin,
     auth,
@@ -15,7 +16,10 @@ from app.routers import (
     users,
 )
 
-app = FastAPI(title="Support Ticket System API", version="0.6.0")
+app = FastAPI(title="Support Ticket System API", version="0.7.0")
+
+# Phase 7: audit every state-changing request centrally
+app.middleware("http")(audit_middleware)
 
 app.include_router(auth.router)
 app.include_router(users.router)

@@ -8,6 +8,7 @@ from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_staff
 from app.models import Ticket, TicketPriority, TicketStatus, User, UserRole
+from app.rate_limit import rate_limit
 from app.reply_drafter import SimilarTicket, get_drafter
 from app.schemas import (
     BulkActionResult,
@@ -53,7 +54,12 @@ def _ensure_can_view(ticket: Ticket, user: User) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
 
 
-@router.post("", response_model=TicketRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=TicketRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[rate_limit("ticket_create", lambda: settings.rate_limit_ticket_create_per_minute)],
+)
 def create_ticket(
     payload: TicketCreate,
     background_tasks: BackgroundTasks,
