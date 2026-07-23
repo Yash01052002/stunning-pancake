@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     smtp_from_address: str = "support@example.com"
     slack_webhook_url: str | None = None
 
+    # Phase 5: agent productivity
+    # how recent a presence heartbeat must be to count as an active viewer
+    presence_window_seconds: int = 60
+    # how many recent resolved tickets in the same category to feed the LLM
+    # reply drafter as "here's how we handled similar ones" context
+    reply_draft_similar_limit: int = 3
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

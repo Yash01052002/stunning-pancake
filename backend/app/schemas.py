@@ -142,6 +142,7 @@ class TicketRead(BaseModel):
     escalated_at: datetime | None
     first_response_sla_status: str | None
     resolution_sla_status: str | None
+    merged_into_id: str | None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None
@@ -251,3 +252,102 @@ class NotificationRead(BaseModel):
     message: str
     read_at: datetime | None
     created_at: datetime
+
+
+# ---- Canned responses (Phase 5) ----
+
+
+class CannedResponseCreate(BaseModel):
+    title: str
+    body: str
+    category: str | None = None
+    active: bool = True
+
+
+class CannedResponseUpdate(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    category: str | None = None
+    active: bool | None = None
+
+
+class CannedResponseRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    body: str
+    category: str | None
+    active: bool
+    created_at: datetime
+
+
+class SuggestedReplies(BaseModel):
+    canned: list[CannedResponseRead]
+    drafted_reply: str | None  # None when the LLM drafter is unavailable/failed
+    similar_ticket_ids: list[str]
+
+
+# ---- KB articles (Phase 5) ----
+
+
+class KBArticleCreate(BaseModel):
+    title: str
+    body: str
+    keywords: str = ""  # comma-separated
+    active: bool = True
+
+
+class KBArticleUpdate(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    keywords: str | None = None
+    active: bool | None = None
+
+
+class KBArticleRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    body: str
+    keywords: str
+    active: bool
+    created_at: datetime
+
+
+class KBSuggestRequest(BaseModel):
+    subject: str = ""
+    body: str = ""
+
+
+# ---- Bulk actions & merge (Phase 5) ----
+
+
+class BulkCloseRequest(BaseModel):
+    ticket_ids: list[str]
+
+
+class BulkReassignRequest(BaseModel):
+    ticket_ids: list[str]
+    assigned_agent_id: str | None = None
+    assigned_team_id: str | None = None
+
+
+class BulkActionResult(BaseModel):
+    updated_ticket_ids: list[str]
+    updated_count: int
+
+
+class MergeRequest(BaseModel):
+    source_ticket_ids: list[str]  # tickets to merge INTO the path param ticket
+
+
+# ---- Presence / collision detection (Phase 5) ----
+
+
+class PresenceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: str
+    last_seen_at: datetime

@@ -143,6 +143,35 @@ def run() -> None:
 
         escalation_report = sla.check_and_escalate_slas(db)
 
+        # Phase 5: canned responses (one category-scoped, one general) + KB
+        # articles for self-service deflection.
+        crud.create_canned_response(
+            db,
+            title="Refund acknowledgement",
+            body="Thanks for reaching out — I've confirmed the duplicate charge and "
+            "issued a refund, which should appear in 3-5 business days.",
+            category="billing",
+        )
+        crud.create_canned_response(
+            db,
+            title="Ask for more detail",
+            body="Thanks for getting in touch! Could you share a bit more detail so I "
+            "can help — for example any error message and when it started?",
+            category=None,
+        )
+        crud.create_kb_article(
+            db,
+            title="How to reset your password",
+            body="Go to Settings > Security > Reset password and follow the emailed link.",
+            keywords="password,reset,login,sign in",
+        )
+        crud.create_kb_article(
+            db,
+            title="Understanding your invoice",
+            body="Invoices are issued monthly; duplicate charges are auto-refunded within 5 days.",
+            keywords="invoice,billing,charge,refund",
+        )
+
         print("Seeded demo data:")
         print("  admin:         admin@example.com / admin12345")
         print("  billing agent: billing-agent@example.com / agent12345 (team: Billing)")
@@ -165,6 +194,7 @@ def run() -> None:
             f"(escalation run: {escalation_report['escalated_count']} ticket(s))"
         )
         print("  SLA policies:  P0/P1/P1-premium/P2/P3 seeded")
+        print("  canned:        2 responses; KB: 2 articles (deflection)")
     finally:
         db.close()
 

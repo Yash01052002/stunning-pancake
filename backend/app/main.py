@@ -2,7 +2,9 @@ from fastapi import FastAPI
 
 from app.routers import (
     auth,
+    canned_responses,
     comments,
+    kb,
     notifications,
     reports,
     sla_policies,
@@ -12,7 +14,7 @@ from app.routers import (
     users,
 )
 
-app = FastAPI(title="Support Ticket System API", version="0.4.0")
+app = FastAPI(title="Support Ticket System API", version="0.5.0")
 
 app.include_router(auth.router)
 app.include_router(users.router)
@@ -23,6 +25,8 @@ app.include_router(triage_rules.router)
 app.include_router(reports.router)
 app.include_router(sla_policies.router)
 app.include_router(notifications.router)
+app.include_router(canned_responses.router)
+app.include_router(kb.router)
 
 
 @app.get("/health")

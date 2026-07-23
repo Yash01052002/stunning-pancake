@@ -9,13 +9,20 @@ the same graceful-degradation pattern as the Phase 3 LLM classifier.
 """
 
 import logging
+import re
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Notification, NotificationType, Ticket, TicketStatus, User
+from app.models import Notification, NotificationType, Ticket, TicketStatus, User, UserRole
 
 logger = logging.getLogger(__name__)
+
+# @-mention by email: "@alex@example.com". Matches an @ immediately followed
+# by an email address. Deliberately email-based — the system has no separate
+# usernames, and emails are unambiguous identifiers.
+_MENTION_RE = re.compile(r"@([\w.+-]+@[\w-]+\.[\w.-]+)")
 
 
 def create_in_app_notification(
@@ -118,6 +125,33 @@ def notify_customer_status_change(db: Session, ticket: Ticket, new_status: Ticke
         db, user=customer, ticket=ticket, type=type_, title=title, message=message
     )
     send_email(to_address=customer.email, subject=title, body=message)
+
+
+def notify_mentions(db: Session, ticket: Ticket, author: User, body: str) -> list[str]:
+    """Parses @email mentions from an internal note and notifies each mentioned
+    staff user (agent/admin). Customers can't be mentioned (mentions are an
+    internal-collaboration feature) and authors don't get notified for
+    mentioning themselves. Returns the notified user ids."""
+    emails = {m.lower() for m in _MENTION_RE.findall(body)}
+    if not emails:
+        return []
+
+    notified: list[str] = []
+    mentioned_users = db.scalars(
+        select(User).where(User.email.in_(emails), User.role != UserRole.CUSTOMER)
+    )
+    for user in mentioned_users:
+        if user.id == author.id:
+            continue
+        title = f"{author.full_name} mentioned you"
+        message = f'{author.full_name} mentioned you on "{ticket.subject}": {body}'
+        create_in_app_notification(
+            db, user=user, ticket=ticket, type=NotificationType.MENTIONED,
+            title=title, message=message,
+        )
+        send_email(to_address=user.email, subject=title, body=message)
+        notified.append(user.id)
+    return notified
 
 
 def notify_sla_escalation(db: Session, ticket: Ticket, agent: User | None, reason: str) -> None:
