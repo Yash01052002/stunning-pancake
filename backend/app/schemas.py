@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models import (
     CustomerTier,
@@ -57,6 +57,10 @@ class UserRead(BaseModel):
 
 
 class TeamCreate(BaseModel):
+    name: str
+
+
+class TeamUpdate(BaseModel):
     name: str
 
 
@@ -143,6 +147,9 @@ class TicketRead(BaseModel):
     first_response_sla_status: str | None
     resolution_sla_status: str | None
     merged_into_id: str | None
+    csat_rating: int | None
+    csat_comment: str | None
+    csat_submitted_at: datetime | None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None
@@ -351,3 +358,74 @@ class PresenceRead(BaseModel):
 
     user_id: str
     last_seen_at: datetime
+
+
+# ---- CSAT & reporting (Phase 6) ----
+
+
+class CSATSubmit(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = None
+
+
+class CategoryCount(BaseModel):
+    category: str | None
+    count: int
+
+
+class VolumeReport(BaseModel):
+    total: int
+    by_category: list[CategoryCount]
+    by_status: dict[str, int]
+    by_priority: dict[str, int]
+
+
+class SLAComplianceReport(BaseModel):
+    # first-response clock
+    first_response_met: int
+    first_response_breached: int
+    first_response_pending: int  # has a due date, clock still running, not yet responded
+    first_response_compliance_rate: float  # met / (met + breached)
+    # resolution clock
+    resolution_met: int
+    resolution_breached: int
+    resolution_pending: int
+    resolution_compliance_rate: float
+
+
+class CSATReport(BaseModel):
+    responses: int
+    average_rating: float | None
+    distribution: dict[int, int]  # rating (1-5) -> count
+
+
+class AgentWorkloadRow(BaseModel):
+    agent_id: str
+    full_name: str
+    open_tickets: int  # assigned + status in new/open/pending
+    resolved_tickets: int
+    total_assigned: int
+
+
+class AgentWorkloadReport(BaseModel):
+    agents: list[AgentWorkloadRow]
+
+
+class TriageTrendBucket(BaseModel):
+    period: str  # YYYY-MM-DD (day bucket)
+    total: int
+    matched: int
+    overridden: int
+    auto_triage_success_rate: float
+
+
+class TriageTrendReport(BaseModel):
+    buckets: list[TriageTrendBucket]
+
+
+# ---- Admin taxonomy (Phase 6) ----
+
+
+class CategoriesReport(BaseModel):
+    configured: list[str]  # from settings.triage_categories (what the LLM classifies into)
+    in_use: list[str]  # distinct categories actually present on rules and tickets

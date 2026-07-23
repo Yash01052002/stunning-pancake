@@ -80,6 +80,17 @@ def list_teams(db: Session) -> list[Team]:
     return list(db.scalars(select(Team)))
 
 
+def get_team(db: Session, team_id: str) -> Team | None:
+    return db.get(Team, team_id)
+
+
+def rename_team(db: Session, team: Team, name: str) -> Team:
+    team.name = name
+    db.commit()
+    db.refresh(team)
+    return team
+
+
 # ---- Tickets ----
 
 
@@ -168,6 +179,19 @@ def update_ticket(db: Session, ticket: Ticket, updates: dict, actor: User) -> Ti
         log_event(db, ticket, "updated", actor, {"changes": changes})
         db.commit()
         db.refresh(ticket)
+    return ticket
+
+
+def submit_csat(db: Session, ticket: Ticket, *, rating: int, comment: str | None, actor: User) -> Ticket:
+    """Records a customer satisfaction rating. Overwrites any prior rating
+    (a customer can revise). Caller enforces the resolved/closed + ownership
+    preconditions."""
+    ticket.csat_rating = rating
+    ticket.csat_comment = comment
+    ticket.csat_submitted_at = _now()
+    log_event(db, ticket, "csat_submitted", actor, {"rating": rating})
+    db.commit()
+    db.refresh(ticket)
     return ticket
 
 

@@ -14,6 +14,7 @@ from app.schemas import (
     BulkCloseRequest,
     BulkReassignRequest,
     CannedResponseRead,
+    CSATSubmit,
     MergeRequest,
     PresenceRead,
     SuggestedReplies,
@@ -131,6 +132,31 @@ def update_ticket(
     ticket = _get_ticket_or_404(db, ticket_id)
     updates = payload.model_dump(exclude_unset=True)
     return crud.update_ticket(db, ticket, updates, actor=current_user)
+
+
+@router.post("/{ticket_id}/csat", response_model=TicketRead)
+def submit_csat(
+    ticket_id: str,
+    payload: CSATSubmit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Customer rates their own resolved/closed ticket (1-5, optional comment).
+    Only the ticket's own customer may rate it, and only once it's resolved
+    or closed."""
+    ticket = _get_ticket_or_404(db, ticket_id)
+    if ticket.customer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only rate your own tickets"
+        )
+    if ticket.status not in (TicketStatus.RESOLVED, TicketStatus.CLOSED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ticket must be resolved or closed before it can be rated",
+        )
+    return crud.submit_csat(
+        db, ticket, rating=payload.rating, comment=payload.comment, actor=current_user
+    )
 
 
 @router.post("/{ticket_id}/triage", response_model=TicketRead)

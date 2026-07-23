@@ -173,6 +173,10 @@ class Ticket(Base):
     # Phase 5: set when this ticket is merged into another (a duplicate). The
     # source is closed; merged_into_id points at the survivor. Self-referential.
     merged_into_id: Mapped[str | None] = mapped_column(ForeignKey("tickets.id"), nullable=True)
+    # Phase 6: customer satisfaction rating (1-5) submitted after resolution.
+    csat_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    csat_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    csat_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
